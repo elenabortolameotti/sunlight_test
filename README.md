@@ -195,3 +195,11 @@ Static CT chunks the log into “tiles” of 256 entries. If the pool is flushed
 partial-aftersun is a command designed to run as a cronjob which deletes superfluous partial tiles from a local storage backend, freeing up space. It reads the Sunlight config file directly, and has a number of safety measures to avoid deleting the wrong tiles.
 
 The Tuscolo public configs include [an example of how to schedule it with systemd timers](https://config.sunlight.geomys.org/#%2fetc%2fsystemd%2fsystem%2fpartial-aftersun.service).
+
+### Forked version of sunlight
+
+Personal version for intership
+
+gdhsfdgxhsfgjs
+fgjcgj
+

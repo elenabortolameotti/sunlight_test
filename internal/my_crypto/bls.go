@@ -20,6 +20,17 @@ type BLSSigner struct {
 	pk      *blst.P1Affine
 }
 
+func NewBLSSignerFromSeed(name string, keyHash uint32, seed []byte) (*BLSSigner, error) {
+	if len(seed) != 32 {
+		return nil, errors.New("seed length must be 32 bytes")
+	}
+	sk := blst.KeyGen(seed)
+	if sk == nil {
+		return nil, errors.New("KeyGen returned nil")
+	}
+	return NewBLSSigner(name, keyHash, sk)
+}
+
 func NewBLSSigner(name string, keyHash uint32, sk *blst.SecretKey) (*BLSSigner, error) {
 	if name == "" {
 		return nil, errors.New("nome signer vuoto")

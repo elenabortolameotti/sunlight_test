@@ -199,7 +199,3 @@ The Tuscolo public configs include [an example of how to schedule it with system
 ### Forked version of sunlight
 
 Personal version for intership
-
-gdhsfdgxhsfgjs
-fgjcgj
-

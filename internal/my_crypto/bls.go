@@ -204,6 +204,42 @@ type AggregateSignature struct {
 	Sig       []byte   `json:"sig"`
 }
 
+func AggregateSignaturesBytes(signatures [][]byte) ([]byte, error) {
+	parsed := make([]*blst.P2Affine, 0, len(signatures))
+	for _, raw := range signatures {
+		sig, err := SignatureFromBytes(raw)
+		if err != nil {
+			return nil, err
+		}
+		parsed = append(parsed, sig)
+	}
+
+	agg, err := Aggregate(parsed)
+	if err != nil {
+		return nil, err
+	}
+
+	return SignatureToBytes(agg)
+}
+
+func VerifyAggregateBytes(pubkeys [][]byte, msg []byte, aggSig []byte) (bool, error) {
+	pks := make([]*blst.P1Affine, 0, len(pubkeys))
+	for _, raw := range pubkeys {
+		pk, err := PublicKeyFromBytes(raw)
+		if err != nil {
+			return false, err
+		}
+		pks = append(pks, pk)
+	}
+
+	sig, err := SignatureFromBytes(aggSig)
+	if err != nil {
+		return false, err
+	}
+
+	return FastAggregateVerify(pks, msg, sig), nil
+}
+
 /*
 // BuildAggregateSignature aggrega più firme e produce una struttura pronta
 // da serializzare o trasportare.

@@ -57,8 +57,9 @@ var (
 )
 
 const (
-	algEd25519 = 1
-	algBLS     = 2
+	algEd25519      = 1
+	algBLS          = 2
+	algBLSAggregate = 3
 )
 
 func isValidName(name string) bool {
@@ -92,6 +93,9 @@ func NewVerifier(vkey string) (Verifier, error) {
 		if err != nil {
 			return nil, errVerifierID
 		}
+
+		v.pubkey = append([]byte(nil), key...)
+
 		v.verify = func(msg, sig []byte) bool {
 			parsedSig, err := my_crypto.SignatureFromBytes(sig)
 			if err != nil {
@@ -116,7 +120,15 @@ func chop(s, sep string) (before, after string) {
 type verifier struct {
 	name   string
 	hash   uint32
+	pubkey []byte
 	verify func([]byte, []byte) bool
+}
+
+func (v *verifier) PublicKeyBytes() ([]byte, error) {
+	if len(v.pubkey) == 0 {
+		return nil, errVerifierID
+	}
+	return append([]byte(nil), v.pubkey...), nil
 }
 
 func (v *verifier) Name() string                { return v.name }

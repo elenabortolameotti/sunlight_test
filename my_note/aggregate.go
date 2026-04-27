@@ -42,11 +42,6 @@ type AggregateNote struct {
 	Agg  *AggregateWitnessSignature
 }
 
-type aggregatePayload struct {
-	Witnesses []WitnessID `json:"witnesses"`
-	Sig       string      `json:"sig"`
-}
-
 func AggregateSign(msg []byte, signers ...Signer) (*AggregateWitnessSignature, error) {
 	if len(msg) == 0 {
 		return nil, errMalformedNote
@@ -153,7 +148,7 @@ func VerifyAggregate(msg []byte, agg *AggregateWitnessSignature, known Verifiers
 
 // es: checkpoint text...
 // — witness-agg alice+12345678,bob+abcdef00 MEUCIQD...
-
+/*
 func SignAggregateNote(n *Note, signers ...Signer) ([]byte, error) {
 	var buf bytes.Buffer
 
@@ -261,6 +256,7 @@ func OpenAggregateNote(msg []byte, known Verifiers) (*AggregateNote, error) {
 		Agg:  agg,
 	}, nil
 }
+*/
 
 // Scopo: aggiunge una firma aggregata a una nota testuale già firmata (e verificata), senza invalidare le firme già presenti.
 func AddAggregateSignatureAfterVerify(msg []byte, known note.Verifiers, signers ...Signer) ([]byte, error) {

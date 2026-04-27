@@ -40,7 +40,7 @@ type Signer interface {
 	Sign(msg []byte) ([]byte, error)
 }
 
-// keyHash computes the key hash for the given server name and encoded public key.
+// identificatore corto per la chiave
 func keyHash(name string, key []byte) uint32 {
 	h := sha256.New()
 	h.Write([]byte(name))
@@ -135,6 +135,16 @@ func (v *verifier) Name() string                { return v.name }
 func (v *verifier) KeyHash() uint32             { return v.hash }
 func (v *verifier) Verify(msg, sig []byte) bool { return v.verify(msg, sig) }
 
+//controlla il prefisso PRIVATE+KEY;
+//estrae name, hash, key;
+//legge il primo byte alg;
+//se alg == algBLS, controlla che il seed sia lungo 32 byte;
+//crea un BLS signer da seed;
+//deriva la public key;
+//ricostruisce pubkey = algBLS || pubkeyBytes;
+//controlla che keyHash(name, pubkey) coincida con l’hash nella stringa;
+//imposta s.sign = blsSigner.Sign.
+
 func NewSigner(skey string) (Signer, error) {
 	priv1, skey := chop(skey, "+")
 	priv2, skey := chop(skey, "+")
@@ -201,6 +211,9 @@ func (s *signer) Name() string                    { return s.name }
 func (s *signer) KeyHash() uint32                 { return s.hash }
 func (s *signer) Sign(msg []byte) ([]byte, error) { return s.sign(msg) }
 
+// Genera una coppia di chiavi BLS nel formato della libreria.
+// signer key: PRIVATE+KEY+name+hash+base64(algBLS || seed32)
+// verifier key: name+hash+base64(algBLS || pubkey)
 func GenerateKey(rand io.Reader, name string) (skey, vkey string, err error) {
 	if !isValidName(name) {
 		return "", "", errSignerID
@@ -234,6 +247,7 @@ func GenerateKey(rand io.Reader, name string) (skey, vkey string, err error) {
 	return skey, vkey, nil
 }
 
+// Costruisce una verifier key testuale a partire da una public key BLS compressa.
 func NewBLSVerifierKey(name string, key []byte) (string, error) {
 	if !isValidName(name) {
 		return "", errVerifierID
@@ -360,6 +374,21 @@ var (
 	sigPrefix = []byte("— ")
 )
 
+//se known == nil, usa lista vuota;
+//verifica che msg sia UTF-8 valido;
+//cerca il separatore \n\n;
+//separa:
+//text;
+//sigs;
+//parsea ogni riga firma;
+//decodifica base64;
+//estrae i primi 4 byte come hash;
+//cerca il verifier con known.Verifier(name, hash);
+//se non lo trova, mette la firma in UnverifiedSigs;
+//se lo trova, chiama: v.Verify(text, sig)
+//se valida, aggiunge la firma a n.Sigs;
+//se non c’è nessuna firma verificata, ritorna UnverifiedNoteError.
+
 func Open(msg []byte, known Verifiers) (*Note, error) {
 	if known == nil {
 		// Treat nil Verifiers as empty list, to produce useful error instead of crash.
@@ -457,6 +486,21 @@ func Open(msg []byte, known Verifiers) (*Note, error) {
 	}
 	return n, nil
 }
+
+//controlla che n.Text finisca con newline;
+//scrive il testo nel buffer;
+//per ogni signer:
+//-prende name;
+//-prende hash;
+//-firma n.Text;
+//-costruisce hash || sig;
+//-codifica in base64;
+//-scrive la riga: — name base64(hash || sig)
+//preserva eventuali firme già presenti non sostituite;
+//restituisce la note completa come bytes.
+
+//esempio: checkpoint text...
+//— witness1 QWxhZGRpbjpvcGVuIHNlc2FtZQ==
 
 func Sign(n *Note, signers ...Signer) ([]byte, error) {
 	var buf bytes.Buffer

@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"filippo.io/sunlight/internal/my_crypto"
+	"golang.org/x/mod/sumdb/note"
 )
 
 type WitnessID struct {
@@ -190,6 +191,7 @@ func SignAggregateNote(n *Note, signers ...Signer) ([]byte, error) {
 
 // Scopo: prende una nota testuale aggregata, la parsea, estrae testo, witness e firma,
 // poi verifica la firma aggregata.
+// Per ora inutile
 func OpenAggregateNote(msg []byte, known Verifiers) (*AggregateNote, error) {
 	if known == nil {
 		known = VerifierList()
@@ -255,6 +257,172 @@ func OpenAggregateNote(msg []byte, known Verifiers) (*AggregateNote, error) {
 	}
 
 	return &AggregateNote{
+		Text: string(text),
+		Agg:  agg,
+	}, nil
+}
+
+// Scopo: aggiunge una firma aggregata a una nota testuale già firmata (e verificata), senza invalidare le firme già presenti.
+func AddAggregateSignatureAfterVerify(msg []byte, known note.Verifiers, signers ...Signer) ([]byte, error) {
+	n, err := note.Open(msg, known)
+	if err != nil {
+		return nil, err
+	}
+
+	split := bytes.LastIndex(msg, sigSplit)
+	if split < 0 {
+		return nil, errMalformedNote
+	}
+
+	text, sigs := msg[:split+1], msg[split+2:]
+	if string(text) != n.Text {
+		return nil, errMalformedNote
+	}
+	if len(sigs) == 0 || sigs[len(sigs)-1] != '\n' {
+		return nil, errMalformedNote
+	}
+
+	agg, err := AggregateSign(text, signers...)
+	if err != nil {
+		return nil, err
+	}
+
+	var witnesses []string
+	for _, w := range agg.Witnesses {
+		if !isValidName(w.Name) {
+			return nil, errInvalidSigner
+		}
+		witnesses = append(witnesses, fmt.Sprintf("%s+%08x", w.Name, w.Hash))
+	}
+
+	var buf bytes.Buffer
+	buf.Write(text)
+	buf.WriteString("\n")
+	buf.Write(sigs)
+	buf.Write(aggSigPrefix)
+	buf.WriteString(strings.Join(witnesses, ","))
+	buf.WriteString(" ")
+	buf.WriteString(base64.StdEncoding.EncodeToString(agg.Sig))
+	buf.WriteString("\n")
+
+	return buf.Bytes(), nil
+}
+
+//controllare formato UTF-8;
+//separare text e blocco firme;
+//separare le righe normali dalla riga — witness-agg;
+//ricostruire una note classica senza witness-agg;
+//verificare la parte log con note.Open;
+//verificare la parte aggregata con VerifyAggregate;
+//controllare che entrambe firmino lo stesso text.
+
+func OpenMixedNote(msg []byte, logVerifiers note.Verifiers, witnessVerifiers Verifiers) (*note.Note, *AggregateNote, error) {
+	if logVerifiers == nil {
+		logVerifiers = note.VerifierList()
+	}
+	if witnessVerifiers == nil {
+		witnessVerifiers = VerifierList()
+	}
+
+	for i := 0; i < len(msg); {
+		r, size := utf8.DecodeRune(msg[i:])
+		if r < 0x20 && r != '\n' || r == utf8.RuneError && size == 1 {
+			return nil, nil, errMalformedNote
+		}
+		i += size
+	}
+
+	split := bytes.LastIndex(msg, sigSplit)
+	if split < 0 {
+		return nil, nil, errMalformedNote
+	}
+
+	text, sigs := msg[:split+1], msg[split+2:]
+	if len(sigs) == 0 || sigs[len(sigs)-1] != '\n' {
+		return nil, nil, errMalformedNote
+	}
+
+	var normalSigs bytes.Buffer
+	var agg *AggregateWitnessSignature
+	foundAgg := false
+
+	for len(sigs) > 0 {
+		i := bytes.IndexByte(sigs, '\n')
+		line := sigs[:i]
+		sigs = sigs[i+1:]
+
+		if bytes.HasPrefix(line, aggSigPrefix) {
+			if foundAgg {
+				return nil, nil, errInvalidAggregateSignature
+			}
+			foundAgg = true
+
+			line = line[len(aggSigPrefix):]
+			witnessList, sig64 := chop(string(line), " ")
+			if witnessList == "" || sig64 == "" {
+				return nil, nil, errMalformedNote
+			}
+
+			sig, err := base64.StdEncoding.DecodeString(sig64)
+			if err != nil || len(sig) == 0 {
+				return nil, nil, errMalformedNote
+			}
+
+			witnessParts := strings.Split(witnessList, ",")
+			witnesses := make([]WitnessID, 0, len(witnessParts))
+
+			for _, part := range witnessParts {
+				name, hash16 := chop(part, "+")
+				hash, err := strconv.ParseUint(hash16, 16, 32)
+				if len(hash16) != 8 || err != nil || !isValidName(name) {
+					return nil, nil, errMalformedNote
+				}
+
+				witnesses = append(witnesses, WitnessID{
+					Name: name,
+					Hash: uint32(hash),
+				})
+			}
+
+			agg = &AggregateWitnessSignature{
+				Witnesses: witnesses,
+				Sig:       sig,
+			}
+
+			continue
+		}
+
+		if !bytes.HasPrefix(line, sigPrefix) {
+			return nil, nil, errMalformedNote
+		}
+
+		normalSigs.Write(line)
+		normalSigs.WriteByte('\n')
+	}
+
+	if !foundAgg {
+		return nil, nil, errInvalidAggregateSignature
+	}
+
+	var logNoteBytes bytes.Buffer
+	logNoteBytes.Write(text)
+	logNoteBytes.WriteString("\n")
+	logNoteBytes.Write(normalSigs.Bytes())
+
+	n, err := note.Open(logNoteBytes.Bytes(), logVerifiers)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if n.Text != string(text) {
+		return nil, nil, errMalformedNote
+	}
+
+	if err := VerifyAggregate(text, agg, witnessVerifiers); err != nil {
+		return nil, nil, err
+	}
+
+	return n, &AggregateNote{
 		Text: string(text),
 		Agg:  agg,
 	}, nil

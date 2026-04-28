@@ -1,4 +1,4 @@
-package mynote
+package my_note
 
 import (
 	"bytes"

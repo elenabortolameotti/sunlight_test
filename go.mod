@@ -12,6 +12,7 @@ require (
 	github.com/aws/smithy-go v1.20.3
 	github.com/google/certificate-transparency-go v1.3.2
 	github.com/prometheus/client_golang v1.22.0
+	github.com/supranational/blst v0.3.16
 	golang.org/x/crypto v0.44.0
 	golang.org/x/mod v0.29.0
 	golang.org/x/net v0.46.0
@@ -57,7 +58,6 @@ require (
 	github.com/prometheus/client_model v0.6.1 // indirect
 	github.com/prometheus/common v0.62.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
-	github.com/supranational/blst v0.3.16 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
 	golang.org/x/time v0.11.0 // indirect

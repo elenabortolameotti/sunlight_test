@@ -304,6 +304,10 @@ func AddAggregateSignatureAfterVerify(msg []byte, known note.Verifiers, signers 
 	return buf.Bytes(), nil
 }
 
+//Idea: prendo una nota che può avere solo firma log oppure firma log + firma aggregata witness;
+// tolgo temporaneamente la riga aggregata; verifico la nota standard con note.Open;
+// poi, se c’era la riga witness, verifico anche quella.
+
 //controllare formato UTF-8;
 //separare text e blocco firme;
 //separare le righe normali dalla riga — witness-agg;
@@ -312,7 +316,12 @@ func AddAggregateSignatureAfterVerify(msg []byte, known note.Verifiers, signers 
 //verificare la parte aggregata con VerifyAggregate;
 //controllare che entrambe firmino lo stesso text.
 
-func OpenMixedNote(msg []byte, logVerifiers note.Verifiers, witnessVerifiers Verifiers) (*note.Note, *AggregateNote, error) {
+func OpenMixedNote(
+	msg []byte,
+	logVerifiers note.Verifiers,
+	witnessVerifiers Verifiers,
+) (*note.Note, *AggregateNote, error) {
+
 	if logVerifiers == nil {
 		logVerifiers = note.VerifierList()
 	}
@@ -320,6 +329,7 @@ func OpenMixedNote(msg []byte, logVerifiers note.Verifiers, witnessVerifiers Ver
 		witnessVerifiers = VerifierList()
 	}
 
+	// validazione UTF-8 (copiata da note.Open)
 	for i := 0; i < len(msg); {
 		r, size := utf8.DecodeRune(msg[i:])
 		if r < 0x20 && r != '\n' || r == utf8.RuneError && size == 1 {
@@ -328,12 +338,16 @@ func OpenMixedNote(msg []byte, logVerifiers note.Verifiers, witnessVerifiers Ver
 		i += size
 	}
 
+	// split text / firme
 	split := bytes.LastIndex(msg, sigSplit)
 	if split < 0 {
 		return nil, nil, errMalformedNote
 	}
 
-	text, sigs := msg[:split+1], msg[split+2:]
+	text := msg[:split]
+	sigs := msg[split+len(sigSplit):]
+
+	// controllo che il blocco firme non sia vuoto e finisca con newline
 	if len(sigs) == 0 || sigs[len(sigs)-1] != '\n' {
 		return nil, nil, errMalformedNote
 	}
@@ -342,11 +356,18 @@ func OpenMixedNote(msg []byte, logVerifiers note.Verifiers, witnessVerifiers Ver
 	var agg *AggregateWitnessSignature
 	foundAgg := false
 
+	// scorro le righe del blocco firme, distinguendo tra firme normali (log) e riga di firma aggregata witness
 	for len(sigs) > 0 {
 		i := bytes.IndexByte(sigs, '\n')
+		if i < 0 {
+			return nil, nil, errMalformedNote
+		}
+
 		line := sigs[:i]
 		sigs = sigs[i+1:]
 
+		// --- firma aggregata ---
+		// al massimo una riga aggregata
 		if bytes.HasPrefix(line, aggSigPrefix) {
 			if foundAgg {
 				return nil, nil, errInvalidAggregateSignature
@@ -354,20 +375,24 @@ func OpenMixedNote(msg []byte, logVerifiers note.Verifiers, witnessVerifiers Ver
 			foundAgg = true
 
 			line = line[len(aggSigPrefix):]
+
+			// separo lista witnesse e firma base64
 			witnessList, sig64 := chop(string(line), " ")
 			if witnessList == "" || sig64 == "" {
 				return nil, nil, errMalformedNote
 			}
 
+			// decodifico la firma base64
 			sig, err := base64.StdEncoding.DecodeString(sig64)
 			if err != nil || len(sig) == 0 {
 				return nil, nil, errMalformedNote
 			}
 
-			witnessParts := strings.Split(witnessList, ",")
-			witnesses := make([]WitnessID, 0, len(witnessParts))
+			// pareso la lista dei witness, che è una stringa del tipo "name1+hash1,name2+hash2,..."
+			parts := strings.Split(witnessList, ",")
+			witnesses := make([]WitnessID, 0, len(parts))
 
-			for _, part := range witnessParts {
+			for _, part := range parts {
 				name, hash16 := chop(part, "+")
 				hash, err := strconv.ParseUint(hash16, 16, 32)
 				if len(hash16) != 8 || err != nil || !isValidName(name) {
@@ -388,6 +413,7 @@ func OpenMixedNote(msg []byte, logVerifiers note.Verifiers, witnessVerifiers Ver
 			continue
 		}
 
+		// --- firma normale (log) ---
 		if !bytes.HasPrefix(line, sigPrefix) {
 			return nil, nil, errMalformedNote
 		}
@@ -396,13 +422,10 @@ func OpenMixedNote(msg []byte, logVerifiers note.Verifiers, witnessVerifiers Ver
 		normalSigs.WriteByte('\n')
 	}
 
-	if !foundAgg {
-		return nil, nil, errInvalidAggregateSignature
-	}
-
+	// ricostruisci la nota "standard" per verificarla con note.Open (cioè senza la riga di firma aggregata witness)
 	var logNoteBytes bytes.Buffer
 	logNoteBytes.Write(text)
-	logNoteBytes.WriteString("\n")
+	logNoteBytes.Write(sigSplit)
 	logNoteBytes.Write(normalSigs.Bytes())
 
 	n, err := note.Open(logNoteBytes.Bytes(), logVerifiers)
@@ -414,6 +437,12 @@ func OpenMixedNote(msg []byte, logVerifiers note.Verifiers, witnessVerifiers Ver
 		return nil, nil, errMalformedNote
 	}
 
+	// --- caso SOLO LOG ---
+	if !foundAgg {
+		return n, nil, nil
+	}
+
+	// --- caso LOG + WITNESS AGG ---
 	if err := VerifyAggregate(text, agg, witnessVerifiers); err != nil {
 		return nil, nil, err
 	}

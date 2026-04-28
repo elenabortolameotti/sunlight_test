@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	my_note "sunlight_test_1/my_note"
+	my_note "filippo.io/sunlight/my_note"
 
 	"crawshaw.io/sqlite"
 	"filippo.io/sunlight"

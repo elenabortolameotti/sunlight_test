@@ -92,7 +92,7 @@ type Witness struct {
 	// accessed and updated under logsMu. The list of origins and their verifier
 	// keys are stored in Backend, and are updated additively by PullLogList.
 	logsMu      sync.RWMutex
-	verifiers   map[string]note.Verifiers
+	verifiers   map[string]note.Verifiers //log verifiers
 	checkpoints map[string]*lockedCheckpoint
 }
 

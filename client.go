@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"filippo.io/sunlight/my_note"
 	"filippo.io/torchwood"
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/tls"
@@ -58,8 +59,8 @@ type ClientConfig struct {
 
 	// PublicKey is the public key of the log, used to verify checkpoints in
 	// [Client.Checkpoint] and SCTs in [Client.CheckInclusion].
-	PublicKey crypto.PublicKey
-
+	PublicKey        crypto.PublicKey
+	WitnessVerifiers my_note.Verifiers
 	// AllowRFC6962ArchivalLeafs indicates whether to accept leafs archived from
 	// RFC 6962 logs, which lack the LeafIndex extension.
 	//
@@ -346,9 +347,17 @@ func (c *Client) Checkpoint(ctx context.Context) (torchwood.Checkpoint, *note.No
 	if err != nil {
 		return torchwood.Checkpoint{}, nil, fmt.Errorf("sunlight: failed to create verifier for checkpoint: %w", err)
 	}
-	n, err := note.Open(signedNote, note.VerifierList(verifier))
+	n, agg, err := my_note.OpenMixedNote(
+		signedNote,
+		note.VerifierList(verifier),
+		c.cc.WitnessVerifiers,
+	)
 	if err != nil {
 		return torchwood.Checkpoint{}, nil, fmt.Errorf("sunlight: failed to verify checkpoint note: %w", err)
+	}
+
+	if agg == nil {
+		return torchwood.Checkpoint{}, nil, fmt.Errorf("sunlight: missing aggregate witness signature")
 	}
 
 	checkpoint, err := torchwood.ParseCheckpoint(n.Text)

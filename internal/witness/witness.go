@@ -85,7 +85,7 @@ func backendKeyForConfig(config *Config) [sha256.Size]byte {
 
 type Witness struct {
 	c *Config
-	s *torchwood.CosignatureSigner
+	//s *torchwood.CosignatureSigner
 	m metrics
 
 	// verifiers and checkpoints are indexed by log origin. They must be
@@ -132,12 +132,12 @@ type lockedCheckpoint struct {
 
 func NewWitness(ctx context.Context, config *Config) (*Witness, error) {
 	//TODO: check
-	s, err := torchwood.NewCosignatureSigner(config.Name, config.Key)
+	/*s, err := torchwood.NewCosignatureSigner(config.Name, config.Key)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't create signer: %w", err)
-	}
+	}*/
 
-	w := &Witness{c: config, s: s, m: initMetrics()}
+	w := &Witness{c: config, m: initMetrics()}
 
 	logs, err := config.Backend.Fetch(ctx, backendKeyForConfig(config))
 	if errors.Is(err, ctlog.ErrLogNotFound) {

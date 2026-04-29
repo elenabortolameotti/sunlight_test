@@ -3,8 +3,6 @@ package witness
 import (
 	"bytes"
 	"context"
-	"crypto"
-	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/asn1"
 	"encoding/json"
@@ -20,6 +18,8 @@ import (
 	"sync"
 
 	"filippo.io/sunlight/internal/ctlog"
+	"filippo.io/sunlight/internal/my_crypto"
+	"filippo.io/sunlight/my_note"
 	"filippo.io/torchwood"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -29,7 +29,7 @@ import (
 
 type Config struct {
 	Name string
-	Key  crypto.Signer
+	Key  *my_crypto.BLSSigner
 
 	Backend ctlog.LockBackend
 	Log     *slog.Logger
@@ -53,7 +53,12 @@ func backendKeyForCheckpoint(config *Config, origin string) [sha256.Size]byte {
 	//
 	// Use the key instead of the name to prevent multiple witnesses from being
 	// erroneously configured with the same key.
-	h.Write(config.Key.Public().(ed25519.PublicKey))
+	pub, err := config.Key.PublicKeyBytes()
+	if err != nil {
+		panic(err)
+	}
+
+	h.Write(pub)
 
 	h.Write([]byte(origin))
 	return [32]byte(h.Sum(nil))
@@ -68,7 +73,13 @@ func backendKeyForConfig(config *Config) [sha256.Size]byte {
 	h.Write(asn1.NullBytes)
 	h.Write([]byte("witness config\n"))
 
-	h.Write(config.Key.Public().(ed25519.PublicKey))
+	pub, err := config.Key.PublicKeyBytes()
+	if err != nil {
+		panic(err)
+	}
+
+	h.Write(pub)
+
 	return [32]byte(h.Sum(nil))
 }
 
@@ -120,6 +131,7 @@ type lockedCheckpoint struct {
 }
 
 func NewWitness(ctx context.Context, config *Config) (*Witness, error) {
+	//TODO: check
 	s, err := torchwood.NewCosignatureSigner(config.Name, config.Key)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't create signer: %w", err)
@@ -169,7 +181,31 @@ func NewWitness(ctx context.Context, config *Config) (*Witness, error) {
 }
 
 func (w *Witness) VerifierKey() string {
-	return w.s.Verifier().String()
+	pub, err := w.c.Key.PublicKeyBytes()
+	if err != nil {
+		panic(err)
+	}
+
+	vkey, err := my_note.NewBLSVerifierKey(w.c.Name, pub)
+	if err != nil {
+		panic(err)
+	}
+
+	return vkey
+}
+
+func (w *Witness) witnessVerifier() (my_note.Verifier, error) {
+	pub, err := w.c.Key.PublicKeyBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	vkey, err := my_note.NewBLSVerifierKey(w.c.Name, pub)
+	if err != nil {
+		return nil, err
+	}
+
+	return my_note.NewVerifier(vkey)
 }
 
 func (w *Witness) PullLogList(ctx context.Context, url string) error {
@@ -379,6 +415,41 @@ func (w *Witness) processAddCheckpointRequest(ctx context.Context, body []byte) 
 	return w.updateCheckpoint(ctx, c.Origin, oldSize, c.N, c.Hash, proof, noteBytes)
 }
 
+func splitAggregateSignature(noteBytes []byte) ([]byte, error) {
+	split := bytes.LastIndex(noteBytes, []byte("\n\n"))
+	if split < 0 {
+		return nil, errors.New("invalid note")
+	}
+
+	sigs := noteBytes[split+2:]
+	if len(sigs) == 0 || sigs[len(sigs)-1] != '\n' {
+		return nil, errors.New("invalid note")
+	}
+
+	var out bytes.Buffer
+
+	for len(sigs) > 0 {
+		i := bytes.IndexByte(sigs, '\n')
+		if i < 0 {
+			return nil, errors.New("invalid note")
+		}
+
+		line := sigs[:i]
+		sigs = sigs[i+1:]
+
+		if bytes.HasPrefix(line, []byte("— witness-agg ")) {
+			out.Write(line)
+			out.WriteByte('\n')
+		}
+	}
+
+	if out.Len() == 0 {
+		return nil, errors.New("missing aggregate signature")
+	}
+
+	return out.Bytes(), nil
+}
+
 func (w *Witness) updateCheckpoint(ctx context.Context, origin string,
 	oldSize, newSize int64, newHash tlog.Hash, proof tlog.TreeProof,
 	noteBytes []byte) ([]byte, error) {
@@ -405,10 +476,21 @@ func (w *Witness) updateCheckpoint(ctx context.Context, origin string,
 			return nil, &conflictError{0}
 		}
 	} else {
-		n, err := note.Open(lock.Bytes(), note.VerifierList(w.s.Verifier()))
+		wv, err := w.witnessVerifier()
 		if err != nil {
+			return nil, errors.New("internal error: can't construct witness verifier")
+		}
+
+		n, agg, err := my_note.OpenMixedNote(
+			lock.Bytes(),
+			w.verifiers[origin],
+			my_note.VerifierList(wv),
+		)
+
+		if err != nil || agg == nil {
 			return nil, errors.New("internal error: can't verify stored checkpoint")
 		}
+
 		known, err := torchwood.ParseCheckpoint(n.Text)
 		if err != nil {
 			return nil, errors.New("internal error: can't parse stored checkpoint")
@@ -428,26 +510,21 @@ func (w *Witness) updateCheckpoint(ctx context.Context, origin string,
 		}
 	}
 
-	// To avoid parser alignment issues, sign a re-encoding of what we interpreted.
-	// If everything is working correctly, it will also be a valid signature on the
-	// original note. If not, this fails safe.
-	// https://bsky.app/profile/filippo.abyssdomain.expert/post/3lezjsf6wc2os
-	signed, err := note.Sign(&note.Note{Text: torchwood.Checkpoint{
-		Origin: origin, Tree: tlog.Tree{N: newSize, Hash: newHash},
-	}.String()}, w.s)
+	fullNote, err := my_note.AddAggregateSignatureAfterVerify(
+		noteBytes,
+		w.verifiers[origin],
+		w.c.Key,
+	)
 	if err != nil {
-		// Don't return the error here and below, to avoid leaking the signature
-		// before the backend compare-and-swap succeeds, which is the ultimate
-		// check against concurrent signers and locking bugs.
 		return nil, errors.New("internal error: failed to sign note")
 	}
-	sigs, err := splitSignatures(signed)
+
+	aggSig, err := splitAggregateSignature(fullNote)
 	if err != nil {
 		return nil, errors.New("internal error: produced invalid note")
 	}
-	new := append(noteBytes[:len(noteBytes):len(noteBytes)], sigs...)
 
-	newLock, err := w.c.Backend.Replace(ctx, lock.LockedCheckpoint, new)
+	newLock, err := w.c.Backend.Replace(ctx, lock.LockedCheckpoint, fullNote)
 	if err != nil {
 		// TODO: this is a fatal error, because we don't know if it was persisted.
 		return nil, errors.New("internal error: failed to store new checkpoint")
@@ -456,7 +533,7 @@ func (w *Witness) updateCheckpoint(ctx context.Context, origin string,
 
 	w.m.LogSize.WithLabelValues(origin).Set(float64(newSize))
 
-	return sigs, nil
+	return aggSig, nil
 }
 
 func splitSignatures(note []byte) ([]byte, error) {

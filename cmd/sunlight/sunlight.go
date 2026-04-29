@@ -28,6 +28,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"maps"
@@ -49,6 +50,7 @@ import (
 	"filippo.io/sunlight/internal/ctlog"
 	"filippo.io/sunlight/internal/heavyhitter"
 	"filippo.io/sunlight/internal/keylog"
+	"filippo.io/sunlight/internal/my_crypto"
 	"filippo.io/sunlight/internal/reused"
 	"filippo.io/sunlight/internal/stdlog"
 	"filippo.io/sunlight/internal/witness"
@@ -532,7 +534,10 @@ func main() {
 		if _, err := io.ReadFull(hkdf.New(sha256.New, seed, []byte("sunlight"), []byte("Ed25519 log key")), ed25519Secret); err != nil {
 			fatalError(logger, "failed to derive Ed25519 key", "err", err)
 		}
-		wk := ed25519.NewKeyFromSeed(ed25519Secret)
+		wk, err := my_crypto.NewBLSSignerFromSeed(c.Witness.Name, 0, ed25519Secret)
+		if err != nil {
+			panic(fmt.Errorf("couldn't create BLS witness key: %w", err))
+		}
 
 		// Compare the checkpoint from the Backend with the one accessible over
 		// the MonitoringPrefix, to catch misconfigurations. We ignore failures
@@ -735,12 +740,20 @@ func main() {
 			fatalError(logger, "witness seed file must be exactly 32 bytes")
 		}
 
-		ed25519Secret := make([]byte, ed25519.SeedSize)
-		if _, err := io.ReadFull(hkdf.New(sha256.New, seed, []byte("sunlight Ed25519 witness key"),
-			[]byte(c.Witness.Name)), ed25519Secret); err != nil {
-			fatalError(logger, "failed to derive Ed25519 key", "err", err)
+		blsSecret := make([]byte, 32)
+		if _, err := io.ReadFull(hkdf.New(
+			sha256.New,
+			seed,
+			[]byte("sunlight BLS witness key"),
+			[]byte(c.Witness.Name),
+		), blsSecret); err != nil {
+			fatalError(logger, "failed to derive BLS key", "err", err)
 		}
-		wk := ed25519.NewKeyFromSeed(ed25519Secret)
+
+		wk, err := my_crypto.NewBLSSignerFromSeed(c.Witness.Name, 0, blsSecret)
+		if err != nil {
+			fatalError(logger, "failed to create BLS witness key", "err", err)
+		}
 
 		w, err := witness.NewWitness(ctx, &witness.Config{
 			Name:    c.Witness.Name,

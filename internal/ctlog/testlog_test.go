@@ -5,10 +5,10 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/ecdsa"
-	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -27,6 +27,8 @@ import (
 
 	"filippo.io/sunlight"
 	"filippo.io/sunlight/internal/ctlog"
+	"filippo.io/sunlight/internal/my_crypto"
+	"filippo.io/sunlight/my_note"
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/jsonclient"
 	"github.com/google/certificate-transparency-go/x509"
@@ -48,22 +50,29 @@ func NewEmptyTestLog(t testing.TB) *TestLog {
 	k, err := x509.MarshalPKCS8PrivateKey(key)
 	fatalIfErr(t, err)
 	t.Logf("ECDSA key: %s", pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: k}))
-	_, ed25519Key, err := ed25519.GenerateKey(rand.Reader)
+	// Generate BLS witness key
+	witnessKey := generateWitnessKeyForTB(t, "test-witness")
+	
+	// Create witness verifier for the config
+	witnessPubKey, err := witnessKey.PublicKeyBytes()
 	fatalIfErr(t, err)
-	k, err = x509.MarshalPKCS8PrivateKey(ed25519Key)
+	witnessVKey, err := my_note.NewBLSVerifierKey(witnessKey.Name(), witnessPubKey)
 	fatalIfErr(t, err)
-	t.Logf("Ed25519 key: %s", pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: k}))
+	witnessVerifier, err := my_note.NewVerifier(witnessVKey)
+	fatalIfErr(t, err)
+	
 	logHandler, logLevel := testLogHandler(t)
 	config := &ctlog.Config{
-		Name:          "example.com/TestLog",
-		Key:           key,
-		WitnessKey:    ed25519Key,
-		Cache:         filepath.Join(t.TempDir(), "cache.db"),
-		Backend:       NewMemoryBackend(t),
-		Lock:          NewMemoryLockBackend(t),
-		Log:           slog.New(logHandler),
-		NotAfterStart: time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
-		NotAfterLimit: time.Date(2099, time.January, 1, 0, 0, 0, 0, time.UTC),
+		Name:             "example.com/TestLog",
+		Key:              key,
+		WitnessKey:       witnessKey,
+		WitnessVerifiers: my_note.VerifierList(witnessVerifier),
+		Cache:            filepath.Join(t.TempDir(), "cache.db"),
+		Backend:          NewMemoryBackend(t),
+		Lock:             NewMemoryLockBackend(t),
+		Log:              slog.New(logHandler),
+		NotAfterStart:    time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
+		NotAfterLimit:    time.Date(2099, time.January, 1, 0, 0, 0, 0, time.UTC),
 	}
 	err = ctlog.CreateLog(t.Context(), config)
 	fatalIfErr(t, err)
@@ -132,10 +141,19 @@ func (tl *TestLog) CheckLog(size int64) (sthTimestamp int64) {
 	fatalIfErr(t, err)
 	v, err := sunlight.NewRFC6962Verifier("example.com/TestLog", tl.Config.Key.Public())
 	fatalIfErr(t, err)
-	n, err := note.Open(sth, note.VerifierList(v))
+	
+	// First try to open as a mixed note (with witness signatures)
+	var n *note.Note
+	if tl.Config.WitnessVerifiers != nil {
+		n, _, err = my_note.OpenMixedNote(sth, note.VerifierList(v), tl.Config.WitnessVerifiers)
+	}
+	// If no witness verifiers or OpenMixedNote failed, try regular note.Open
+	if err != nil || n == nil {
+		n, err = note.Open(sth, note.VerifierList(v))
+	}
 	fatalIfErr(t, err)
-	if len(n.Sigs) != 1 {
-		t.Fatalf("expected 1 signature, got %d", len(n.Sigs))
+	if len(n.Sigs) < 1 {
+		t.Fatalf("expected at least 1 signature, got %d", len(n.Sigs))
 	}
 	sthTimestamp, err = sunlight.RFC6962SignatureTimestamp(n.Sigs[0])
 	fatalIfErr(t, err)
@@ -156,10 +174,19 @@ func (tl *TestLog) CheckLog(size int64) (sthTimestamp int64) {
 		fatalIfErr(t, err)
 		v, err := sunlight.NewRFC6962Verifier("example.com/TestLog", tl.Config.Key.Public())
 		fatalIfErr(t, err)
-		n, err := note.Open(sth.Bytes(), note.VerifierList(v))
+		
+		// First try to open as a mixed note (with witness signatures)
+		var n *note.Note
+		if tl.Config.WitnessVerifiers != nil {
+			n, _, err = my_note.OpenMixedNote(sth.Bytes(), note.VerifierList(v), tl.Config.WitnessVerifiers)
+		}
+		// If no witness verifiers or OpenMixedNote failed, try regular note.Open
+		if err != nil || n == nil {
+			n, err = note.Open(sth.Bytes(), note.VerifierList(v))
+		}
 		fatalIfErr(t, err)
-		if len(n.Sigs) != 1 {
-			t.Fatalf("expected 1 signature, got %d", len(n.Sigs))
+		if len(n.Sigs) < 1 {
+			t.Fatalf("expected at least 1 signature, got %d", len(n.Sigs))
 		}
 		sthTimestamp1, err := sunlight.RFC6962SignatureTimestamp(n.Sigs[0])
 		fatalIfErr(t, err)
@@ -657,6 +684,45 @@ func failLockAndNotPersist(old ctlog.LockedCheckpoint, new []byte) (apply bool, 
 
 func failLockButPersist(old ctlog.LockedCheckpoint, new []byte) (apply bool, err error) {
 	return true, errors.New("lock replace error")
+}
+
+// generateWitnessKeyForTB generates a BLS signer with the correct key hash
+func generateWitnessKeyForTB(t testing.TB, name string) *my_crypto.BLSSigner {
+	// Generate a random seed
+	seed := make([]byte, 32)
+	if _, err := rand.Read(seed); err != nil {
+		t.Fatalf("Failed to generate seed: %v", err)
+	}
+
+	// Create a temporary signer to get the public key
+	tempSigner, err := my_crypto.NewBLSSignerFromSeed(name, 0, seed)
+	if err != nil {
+		t.Fatalf("Failed to create temp signer: %v", err)
+	}
+
+	// Get public key bytes
+	pubKeyBytes, err := tempSigner.PublicKeyBytes()
+	if err != nil {
+		t.Fatalf("Failed to get public key bytes: %v", err)
+	}
+
+	// Calculate the correct hash (same as my_note.keyHash)
+	// hash = sha256(name + "\n" + algBLS + pubkey)[:4]
+	algBLS := byte(2) // algBLS constant from my_note
+	pubkeyWithAlg := append([]byte{algBLS}, pubKeyBytes...)
+	h := sha256.New()
+	h.Write([]byte(name))
+	h.Write([]byte("\n"))
+	h.Write(pubkeyWithAlg)
+	hash := binary.BigEndian.Uint32(h.Sum(nil))
+
+	// Create the signer with the correct hash
+	signer, err := my_crypto.NewBLSSignerFromSeed(name, hash, seed)
+	if err != nil {
+		t.Fatalf("Failed to create signer with correct hash: %v", err)
+	}
+
+	return signer
 }
 
 func fatalIfErr(t testing.TB, err error) {

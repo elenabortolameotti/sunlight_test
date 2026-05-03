@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
-	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
@@ -22,6 +21,7 @@ import (
 
 	"filippo.io/sunlight"
 	"filippo.io/sunlight/internal/ctlog"
+	"filippo.io/sunlight/internal/my_crypto"
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/tls"
 )
@@ -560,9 +560,13 @@ func TestReloadWrongKey(t *testing.T) {
 	}
 
 	c = tl.Config
-	_, ed25519Key, err := ed25519.GenerateKey(rand.Reader)
+	// Generate a different BLS key to test failure case
+	witnessSeed := make([]byte, 32)
+	_, err = rand.Read(witnessSeed)
 	fatalIfErr(t, err)
-	c.WitnessKey = ed25519Key
+	witnessKey, err := my_crypto.NewBLSSignerFromSeed("different-witness", 99999, witnessSeed)
+	fatalIfErr(t, err)
+	c.WitnessKey = witnessKey
 	if _, err := ctlog.LoadLog(context.Background(), c); err == nil {
 		t.Error("expected loading to fail")
 	}

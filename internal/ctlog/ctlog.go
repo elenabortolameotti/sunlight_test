@@ -357,7 +357,8 @@ func openCheckpoint(config *Config, b []byte) (sunlight.Checkpoint, int64, error
 		return sunlight.Checkpoint{}, 0, fmt.Errorf("couldn't verify checkpoint signature: %w", err)
 	}
 
-	if agg == nil {
+	// The aggregate witness signature is optional if no witness verifiers are configured
+	if agg == nil && config.WitnessVerifiers != nil {
 		return sunlight.Checkpoint{}, 0, errors.New("missing aggregate witness signature")
 	}
 	var timestamp int64
@@ -1218,20 +1219,22 @@ func signTreeHead(c *Config, tree treeWithTimestamp) (checkpoint []byte, err err
 		return nil, fmtErrorf("couldn't sign note: %w", err)
 	}
 
-	// Costruisci verifier del log
-	v1, err := sunlight.NewRFC6962Verifier(c.Name, c.Key.Public())
-	if err != nil {
-		return nil, fmtErrorf("couldn't construct verifier: %w", err)
-	}
+	// Aggiungi firma BLS aggregata solo se WitnessKey è configurata
+	if c.WitnessKey != nil {
+		// Costruisci verifier del log
+		v1, err := sunlight.NewRFC6962Verifier(c.Name, c.Key.Public())
+		if err != nil {
+			return nil, fmtErrorf("couldn't construct verifier: %w", err)
+		}
 
-	// Aggiungi firma BLS aggregata
-	signedNote, err = my_note.AddAggregateSignatureAfterVerify(
-		signedNote,
-		note.VerifierList(v1),
-		c.WitnessKey,
-	)
-	if err != nil {
-		return nil, fmtErrorf("couldn't add aggregate witness signature: %w", err)
+		signedNote, err = my_note.AddAggregateSignatureAfterVerify(
+			signedNote,
+			note.VerifierList(v1),
+			c.WitnessKey,
+		)
+		if err != nil {
+			return nil, fmtErrorf("couldn't add aggregate witness signature: %w", err)
+		}
 	}
 
 	return signedNote, nil

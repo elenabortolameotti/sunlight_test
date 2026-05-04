@@ -1,0 +1,26 @@
+# Binaries
+sunlight-test
+bls-verify
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+test/.test-run/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp

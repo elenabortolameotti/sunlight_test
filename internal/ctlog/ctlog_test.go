@@ -566,7 +566,7 @@ func TestReloadWrongKey(t *testing.T) {
 	fatalIfErr(t, err)
 	witnessKey, err := my_crypto.NewBLSSignerFromSeed("different-witness", 99999, witnessSeed)
 	fatalIfErr(t, err)
-	c.WitnessKey = witnessKey
+	c.WitnessKeys = []*my_crypto.BLSSigner{witnessKey}
 	if _, err := ctlog.LoadLog(context.Background(), c); err == nil {
 		t.Error("expected loading to fail")
 	}

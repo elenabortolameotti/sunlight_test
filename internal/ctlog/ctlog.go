@@ -99,8 +99,9 @@ func (t tileWithBytes) String() string {
 type Config struct {
 	Name string
 	Key  *ecdsa.PrivateKey
-	// Chiave locale del witness, se questo nodo deve witnessare.
-	WitnessKey *my_crypto.BLSSigner
+	// WitnessKeys contains the BLS signing keys for all witnesses.
+	// When multiple witnesses are configured, their signatures are aggregated.
+	WitnessKeys []*my_crypto.BLSSigner
 
 	WitnessVerifiers my_note.Verifiers
 
@@ -1219,18 +1220,24 @@ func signTreeHead(c *Config, tree treeWithTimestamp) (checkpoint []byte, err err
 		return nil, fmtErrorf("couldn't sign note: %w", err)
 	}
 
-	// Aggiungi firma BLS aggregata solo se WitnessKey è configurata
-	if c.WitnessKey != nil {
-		// Costruisci verifier del log
+	// Add aggregated BLS witness signatures if any witness keys are configured
+	if len(c.WitnessKeys) > 0 {
+		// Build log verifier
 		v1, err := sunlight.NewRFC6962Verifier(c.Name, c.Key.Public())
 		if err != nil {
 			return nil, fmtErrorf("couldn't construct verifier: %w", err)
 		}
 
+		// Convert witness keys to signers (they implement my_note.Signer)
+		var signers []my_note.Signer
+		for _, key := range c.WitnessKeys {
+			signers = append(signers, key)
+		}
+
 		signedNote, err = my_note.AddAggregateSignatureAfterVerify(
 			signedNote,
 			note.VerifierList(v1),
-			c.WitnessKey,
+			signers...,
 		)
 		if err != nil {
 			return nil, fmtErrorf("couldn't add aggregate witness signature: %w", err)

@@ -65,7 +65,7 @@ func NewEmptyTestLog(t testing.TB) *TestLog {
 	config := &ctlog.Config{
 		Name:             "example.com/TestLog",
 		Key:              key,
-		WitnessKey:       witnessKey,
+		WitnessKeys:      []*my_crypto.BLSSigner{witnessKey},
 		WitnessVerifiers: my_note.VerifierList(witnessVerifier),
 		Cache:            filepath.Join(t.TempDir(), "cache.db"),
 		Backend:          NewMemoryBackend(t),

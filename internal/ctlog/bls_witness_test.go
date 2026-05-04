@@ -371,7 +371,7 @@ func NewTestLogWithBLSWitness(t *testing.T, logKey *ecdsa.PrivateKey, witnessKey
 	config := &ctlog.Config{
 		Name:             "test.example.com/log",
 		Key:              logKey,
-		WitnessKey:       witnessKey,
+		WitnessKeys:      []*my_crypto.BLSSigner{witnessKey},
 		WitnessVerifiers: my_note.VerifierList(witnessVerifier),
 		PoolSize:         100,
 		Cache:            filepath.Join(t.TempDir(), "cache.db"),
@@ -462,13 +462,16 @@ func verifyCheckpointSignatures(t *testing.T, tl *TestLogWithBLS, checkpointByte
 		return fmt.Errorf("failed to create log verifier: %w", err)
 	}
 
-	// Create witness verifier
-	witnessPubKey, err := tl.Config.WitnessKey.PublicKeyBytes()
+	// Create witness verifier (use first witness key)
+	if len(tl.Config.WitnessKeys) == 0 {
+		return fmt.Errorf("no witness keys configured")
+	}
+	witnessPubKey, err := tl.Config.WitnessKeys[0].PublicKeyBytes()
 	if err != nil {
 		return fmt.Errorf("failed to get witness public key: %w", err)
 	}
 
-	witnessVKey, err := my_note.NewBLSVerifierKey(tl.Config.WitnessKey.Name(), witnessPubKey)
+	witnessVKey, err := my_note.NewBLSVerifierKey(tl.Config.WitnessKeys[0].Name(), witnessPubKey)
 	if err != nil {
 		return fmt.Errorf("failed to create witness verifier key: %w", err)
 	}

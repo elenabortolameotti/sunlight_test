@@ -17,13 +17,13 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	_ "embed"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -48,6 +48,7 @@ import (
 
 	"filippo.io/keygen"
 	"filippo.io/sunlight/internal/ctlog"
+	"filippo.io/sunlight/my_note"
 	"filippo.io/sunlight/internal/heavyhitter"
 	"filippo.io/sunlight/internal/keylog"
 	"filippo.io/sunlight/internal/my_crypto"
@@ -134,6 +135,7 @@ type Config struct {
 
 	// Witness is the configuration for the optional witness server, which uses
 	// the compare-and-swap backend.
+	// Deprecated: Use Witnesses instead to support multiple witnesses.
 	Witness struct {
 		// Name is the cosigner name.
 		Name string
@@ -163,7 +165,28 @@ type Config struct {
 		LogLists []string
 	}
 
+	// Witnesses is a list of witness configurations for multiple witness support.
+	// When multiple witnesses are configured, their signatures are aggregated into
+	// a single BLS aggregate signature.
+	Witnesses []WitnessConfig
+
 	Logs []LogConfig
+}
+
+// WitnessConfig represents a single witness configuration for multiple witness support.
+type WitnessConfig struct {
+	// Name is the cosigner name.
+	Name string
+
+	// SubmissionPrefix is the full URL of the c2sp.org/tlog-witness
+	// submission prefix of the witness. If not set, it defaults to
+	// "https://" + Name.
+	SubmissionPrefix string
+
+	// Secret is the path to a file containing a secret seed from which the
+	// witness's private key is derived. The file contents are used as HKDF
+	// input and mixed with the Name. It must be exactly 32 bytes long.
+	Secret string
 }
 
 type LogConfig struct {
@@ -530,13 +553,69 @@ func main() {
 			fatalError(logger, "failed to generate ECDSA key", "err", err)
 		}
 
-		ed25519Secret := make([]byte, ed25519.SeedSize)
-		if _, err := io.ReadFull(hkdf.New(sha256.New, seed, []byte("sunlight"), []byte("Ed25519 log key")), ed25519Secret); err != nil {
-			fatalError(logger, "failed to derive Ed25519 key", "err", err)
+			// Initialize witness keys - support both old single witness config and new multiple witnesses config
+		var witnessKeys []*my_crypto.BLSSigner
+		var witnessConfigs []WitnessConfig
+		
+		// Check if new Witnesses config is used
+		if len(c.Witnesses) > 0 {
+			witnessConfigs = c.Witnesses
+		} else if c.Witness.Name != "" {
+			// Fall back to deprecated single Witness config for backward compatibility
+			witnessConfigs = []WitnessConfig{
+				{Name: c.Witness.Name, Secret: c.Witness.Secret, SubmissionPrefix: c.Witness.SubmissionPrefix},
+			}
 		}
-		wk, err := my_crypto.NewBLSSignerFromSeed(c.Witness.Name, 0, ed25519Secret)
-		if err != nil {
-			panic(fmt.Errorf("couldn't create BLS witness key: %w", err))
+		
+		// Create BLS signer for each witness
+		for _, wc := range witnessConfigs {
+			// Load witness secret
+			var blsSecret []byte
+			if wc.Secret != "" {
+				var err error
+				blsSecret, err = os.ReadFile(wc.Secret)
+				if err != nil {
+					fatalError(logger, "failed to load witness secret", "witness", wc.Name, "err", err)
+				}
+			} else {
+				// Derive from log seed (backward compatibility)
+				blsSecret = make([]byte, 32)
+				if _, err := io.ReadFull(hkdf.New(sha256.New, seed, []byte("sunlight"), []byte("BLS witness key")), blsSecret); err != nil {
+					fatalError(logger, "failed to derive BLS secret", "witness", wc.Name, "err", err)
+				}
+			}
+			
+			if len(blsSecret) != 32 {
+				fatalError(logger, "witness secret must be exactly 32 bytes", "witness", wc.Name)
+			}
+			
+			// Create temporary signer to get public key for hash calculation
+			tempSigner, err := my_crypto.NewBLSSignerFromSeed(wc.Name, 0, blsSecret)
+			if err != nil {
+				fatalError(logger, "failed to create temporary BLS signer", "witness", wc.Name, "err", err)
+			}
+			
+			pubKeyBytes, err := tempSigner.PublicKeyBytes()
+			if err != nil {
+				fatalError(logger, "failed to get BLS public key", "witness", wc.Name, "err", err)
+			}
+			
+			// Calculate proper key hash: sha256(name + "\n" + algBLS + pubkey)[:4]
+			algBLS := byte(2)
+			pubkeyWithAlg := append([]byte{algBLS}, pubKeyBytes...)
+			h := sha256.New()
+			h.Write([]byte(wc.Name))
+			h.Write([]byte("\n"))
+			h.Write(pubkeyWithAlg)
+			keyHash := binary.BigEndian.Uint32(h.Sum(nil))
+			
+			wk, err := my_crypto.NewBLSSignerFromSeed(wc.Name, keyHash, blsSecret)
+			if err != nil {
+				fatalError(logger, "couldn't create BLS witness key", "witness", wc.Name, "err", err)
+			}
+			
+			witnessKeys = append(witnessKeys, wk)
+			logger.Info("created witness key", "witness", wc.Name, "keyHash", fmt.Sprintf("%08x", keyHash))
 		}
 
 		// Compare the checkpoint from the Backend with the one accessible over
@@ -581,17 +660,40 @@ func main() {
 				"name", lc.Name, "submissionPrefix", lc.SubmissionPrefix)
 		}
 
+			// Create witness verifiers for all configured witnesses
+		var witnessVerifiers []my_note.Verifier
+		for _, wk := range witnessKeys {
+			pubKeyBytes, err := wk.PublicKeyBytes()
+			if err != nil {
+				fatalError(logger, "failed to get witness public key", "witness", wk.Name(), "err", err)
+			}
+			vkey, err := my_note.NewBLSVerifierKey(wk.Name(), pubKeyBytes)
+			if err != nil {
+				fatalError(logger, "failed to create witness verifier key", "witness", wk.Name(), "err", err)
+			}
+			v, err := my_note.NewVerifier(vkey)
+			if err != nil {
+				fatalError(logger, "failed to create witness verifier", "witness", wk.Name(), "err", err)
+			}
+			witnessVerifiers = append(witnessVerifiers, v)
+		}
+		
+		if len(witnessVerifiers) > 0 {
+			logger.Info("configured witness verifiers", "count", len(witnessVerifiers))
+		}
+
 		cc := &ctlog.Config{
-			Name:          prefix.Host + prefix.Path,
-			Key:           k,
-			WitnessKey:    wk,
-			Cache:         lc.Cache,
-			PoolSize:      lc.PoolSize,
-			Backend:       b,
-			Lock:          db,
-			Log:           logger,
-			NotAfterStart: notAfterStart,
-			NotAfterLimit: notAfterLimit,
+			Name:             prefix.Host + prefix.Path,
+			Key:              k,
+			WitnessKeys:      witnessKeys,
+			WitnessVerifiers: my_note.VerifierList(witnessVerifiers...),
+			Cache:            lc.Cache,
+			PoolSize:         lc.PoolSize,
+			Backend:          b,
+			Lock:             db,
+			Log:              logger,
+			NotAfterStart:    notAfterStart,
+			NotAfterLimit:    notAfterLimit,
 		}
 
 		if time.Now().Format(time.DateOnly) == lc.Inception {

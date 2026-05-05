@@ -1,6 +1,6 @@
 # Binaries
 sunlight-test
-bls-verify
+/bls-verify
 *.exe
 *.dll
 *.so

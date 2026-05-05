@@ -76,10 +76,28 @@ mkdir -p "$TEST_DIR"/{logs,data,certs,config,results}
 # Check for required binaries
 if [ ! -f "$SUNLIGHT_BIN" ]; then
     echo -e "${RED}Error: sunlight-test binary not found at ${SUNLIGHT_BIN}${NC}"
-    echo "Please build it first with:"
+    echo ""
+    echo "Please build the required binaries first:"
     echo "  cd ${REPO_ROOT}"
     echo "  CGO_CFLAGS=\"-O -D__BLST_PORTABLE__\" go build -o sunlight-test ./cmd/sunlight/"
+    echo ""
+    echo "Optional (for client verification test):"
+    echo "  CGO_CFLAGS=\"-O -D__BLST_PORTABLE__\" go build -o bls-verify ./cmd/bls-verify/"
+    echo ""
+    echo "Repository structure check:"
+    echo "  Looking for: ${REPO_ROOT}/sunlight-test"
+    echo "  Repo root: ${REPO_ROOT}"
+    ls -la "${REPO_ROOT}/sunlight-test" 2>&1 || echo "  Binary not found!"
     exit 1
+fi
+
+# Check if bls-verify source exists
+if [ ! -d "${REPO_ROOT}/cmd/bls-verify" ]; then
+    echo -e "${YELLOW}Warning: bls-verify source directory not found at ${REPO_ROOT}/cmd/bls-verify${NC}"
+    echo "The client verification test will be skipped."
+    echo ""
+    echo "Directory structure:"
+    ls -la "${REPO_ROOT}/cmd/" 2>&1 || echo "  cmd directory not found!"
 fi
 
 # Generate seed for log
@@ -111,11 +129,34 @@ done
 cd "$REPO_ROOT"
 echo -e "${GREEN}✓ Generated certificates${NC}"
 
-# Create database
-sqlite3 "$TEST_DIR/data/checkpoints.db" \
-    "CREATE TABLE IF NOT EXISTS checkpoints (logID BLOB PRIMARY KEY, body BLOB NOT NULL) STRICT" \
-    2>/dev/null
-echo -e "${GREEN}✓ Created database${NC}"
+# Create database with proper error handling
+mkdir -p "$TEST_DIR/data"
+
+# Check if sqlite3 is available
+if ! command -v sqlite3 &> /dev/null; then
+    echo -e "${RED}Error: sqlite3 command not found${NC}"
+    echo "Please install SQLite3:"
+    echo "  Ubuntu/Debian: sudo apt-get install sqlite3"
+    echo "  macOS: brew install sqlite"
+    echo "  Other: https://sqlite.org/download.html"
+    exit 1
+fi
+
+# Create database file
+DB_FILE="$TEST_DIR/data/checkpoints.db"
+if ! sqlite3 "$DB_FILE" "CREATE TABLE IF NOT EXISTS checkpoints (logID BLOB PRIMARY KEY, body BLOB NOT NULL) STRICT"; then
+    echo -e "${RED}Error: Failed to create SQLite database at ${DB_FILE}${NC}"
+    echo "Make sure you have write permissions to ${TEST_DIR}/data/"
+    exit 1
+fi
+
+# Verify database was created
+if [ ! -f "$DB_FILE" ]; then
+    echo -e "${RED}Error: Database file was not created at ${DB_FILE}${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}✓ Created database at ${DB_FILE}${NC}"
 
 # Create config file with absolute paths (reproducible on any machine)
 # Using the new 'witnesses:' format to support multiple witnesses

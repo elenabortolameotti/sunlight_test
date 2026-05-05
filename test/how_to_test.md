@@ -72,6 +72,10 @@ All witness signatures are aggregated into a single 96-byte BLS signature. The c
 
 - Built `sunlight-test` binary in repo root
 - Built `bls-verify` binary in repo root (optional but recommended)
+- **SQLite3** (for checkpoint database)
+  - Ubuntu/Debian: `sudo apt-get install sqlite3`
+  - macOS: `brew install sqlite`
+  - Windows: Download from https://sqlite.org/download.html
 - OpenSSL for certificate generation
 - curl for HTTP testing
 - Python3 (for monitoring HTTP server)

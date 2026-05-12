@@ -1,23 +1,8 @@
-// Command sunlight runs a Certificate Transparency log write-path server.
-//
-// A YAML config file is required (specified with -c, by default sunlight.yaml),
-// the keys are documented in the [Config] type.
-//
-// If the command line flag -testcert is passed, ACME will be disabled and the
-// certificate will be loaded from sunlight.pem and sunlight-key.pem.
-//
-// Metrics are exposed publicly at /metrics, and logs are written to stderr in
-// human-readable format, and to stdout in JSON format.
-//
-// A private HTTP debug server is also started on a random port on localhost. It
-// serves the net/http/pprof endpoints, the [heavyhitter] endpoints, the
-// [keylog] endpoints, and the [stdlog] endpoints.
+// Command sunlight runs a general-purpose append-only log write-path server.
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/tls"
@@ -41,7 +26,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"syscall"
 	"text/template"
 	"time"
 
@@ -51,7 +35,6 @@ import (
 	"filippo.io/sunlight/internal/keylog"
 	"filippo.io/sunlight/internal/reused"
 	"filippo.io/sunlight/internal/stdlog"
-	"filippo.io/sunlight/internal/witness"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -65,280 +48,57 @@ import (
 )
 
 type Config struct {
-	// Listen are the addresses to listen on, e.g. ":443".
 	Listen []string
-
-	// ACME configures how Sunlight automatically obtains certificates for its HTTPS
-	// endpoints. Optional. If missing, Sunlight will listen for plain HTTP or h2c.
-	ACME struct {
-		// Cache is the path to the directory where keys and certificates will
-		// be stored. It will be created if it doesn't already exist.
-		Cache string
-
-		// Hosts are extra names for which Sunlight will obtain a certificate,
-		// beyond those configured as part of the SubmissionPrefix of logs and
-		// witness. Optional.
-		Hosts []string
-
-		// Directory is an ACME directory URL to request a certificate from.
-		// Defaults to Let's Encrypt Production. Optional.
+	ACME   struct {
+		Cache     string
+		Hosts     []string
 		Directory string
 	}
-
-	// Checkpoints, ETagS3, or DynamoDB configure the global lock backend, which
-	// stores the latest checkpoint for each log, with compare-and-swap semantics.
-	//
-	// Note that these are global as an extra safety measure: entries are keyed
-	// by log ID (the hash of the public key), so even in case of
-	// misconfiguration of the logs entries, even across different concurrent
-	// instances of Sunlight, a log can't split.
-	//
-	// Only one of these can be set at the same time.
-
-	// Checkpoints is the path to the SQLite file.
-	//
-	// The database must already exist to protect against accidental
-	// misconfiguration. Create the table with:
-	//
-	//     $ sqlite3 checkpoints.db "CREATE TABLE checkpoints (logID BLOB PRIMARY KEY, body BLOB NOT NULL) STRICT"
-	//
 	Checkpoints string
-
-	// ETagS3 is an S3-compatible object storage bucket that supports ETag on
-	// both reads and writes, and If-Match on writes, such as Tigris.
-	ETagS3 struct {
-		// Region is the AWS region for the S3 bucket.
-		Region string
-
-		// Bucket is the name of the S3 bucket.
-		Bucket string
-
-		// Endpoint is the base URL the AWS SDK will use to connect to S3.
+	ETagS3      struct {
+		Region   string
+		Bucket   string
 		Endpoint string
 	}
-
 	DynamoDB struct {
-		// Region is the AWS region for the DynamoDB table.
-		Region string
-
-		// Table is the name of the DynamoDB table.
-		//
-		// The table must have a primary key named "logID" of type binary.
-		Table string
-
-		// Endpoint is the base URL the AWS SDK will use to connect to DynamoDB. Optional.
+		Region   string
+		Table    string
 		Endpoint string
 	}
-
-	// Witness is the configuration for the optional witness server, which uses
-	// the compare-and-swap backend.
-	Witness struct {
-		// Name is the cosigner name.
-		Name string
-
-		// SubmissionPrefix is the full URL of the c2sp.org/tlog-witness
-		// submission prefix of the witness. If not set, it defaults to
-		// "https://" + Name.
-		//
-		// The HTTP server will serve the witness at this URL, and if ACME is
-		// enabled, Sunlight will obtain a certificate for the host of this URL.
-		SubmissionPrefix string
-
-		// Secret is the path to a file containing a secret seed from which the
-		// witness's private key is derived. The file contents are used as HKDF
-		// input and mixed with the Name. It must be exactly 32 bytes long.
-		//
-		// To generate a new seed, run:
-		//
-		//   $ sunlight-keygen -f seed.bin -witness <name>
-		//
-		Secret string
-
-		// LogList are the URLs of witness network log list.
-		//
-		// Logs are pulled from the lists on startup and every 15 minutes. The
-		// lists can only add logs, never remove them or change their public key.
-		LogLists []string
-	}
-
 	Logs []LogConfig
 }
 
 type LogConfig struct {
-	// Name is the fully qualified log name for the checkpoint origin line, as a
-	// schema-less URL.
-	//
-	// Deprecated: this should be omitted and must match SubmissionPrefix.
-	Name string
-
-	// ShortName is the short name for the log, used as a metrics and logs label.
-	ShortName string
-
-	// Inception is the creation date of the log, as an RFC 3339 date.
-	//
-	// On the inception date, the log will be created if it doesn't exist. After
-	// that date, a non-existing log will be a fatal error. This assumes it is
-	// due to misconfiguration, and prevents accidental forks.
-	Inception string
-
-	// Period is the time between sequence operations, as milliseconds.
-	//
-	// If a sequencing is still in progress when the next one is due, the next
-	// one will be skipped.
-	//
-	// Defaults to 1000 milliseconds (1 second).
-	Period int
-
-	// HTTPHost is the host name for the HTTP endpoint of this log instance.
-	//
-	// Deprecated: this should be omitted and must match SubmissionPrefix.
-	HTTPHost string
-
-	// HTTPPrefix is the prefix for the HTTP endpoint of this log instance,
-	// without trailing slash, but with a leading slash if not empty, and
-	// without "/ct/v1" suffix.
-	//
-	// Deprecated: this should be omitted and must match SubmissionPrefix.
-	HTTPPrefix string
-
-	// SubmissionPrefix is the full URL of the c2sp.org/static-ct-api submission
-	// prefix of the log.
-	//
-	// The HTTP server will serve the log at this URL, and if ACME is enabled,
-	// Sunlight will obtain a certificate for the host of this URL.
+	Name             string
+	ShortName        string
+	Inception        string
+	Period           int
+	HTTPHost         string
+	HTTPPrefix       string
 	SubmissionPrefix string
-
-	// MonitoringPrefix is the full URL of the c2sp.org/static-ct-api monitoring
-	// prefix of the log.
 	MonitoringPrefix string
-
-	// Roots is the path to the accepted roots as a PEM file. They are reloaded
-	// on SIGHUP from the same path (i.e. the config file itself is not
-	// reloaded). Optional. Only one of CCADBRoots and Roots can be set.
-	//
-	// Note that the contents of this file are uploaded to Backend as-is.
-	Roots string
-
-	// CCADBRoots can be "trusted" or "testing". Optional. It defaults to
-	// "trusted" if Roots is not set.
-	//
-	// If "trusted", the log will fetch accepted roots from the CCADB list of
-	// CAs trusted by at least one of the CCADB root stores. If "testing", the
-	// log will fetch CAs that have applied to at least one of the CCADB root
-	// stores and are not part of the "trusted" list.
-	//
-	// The list is refreshed periodically and on SIGHUP, but roots are never
-	// removed for the lifespan of a log.
-	//
-	// Any roots in the ExtraRoots file will be merged with the CCADB roots, and
-	// the Google Merge Delay Monitor Root will be added automatically.
-	CCADBRoots string
-
-	// ExtraRoots is the path to a PEM file containing extra roots that are
-	// merged with those fetched from CCADB. It is reloaded from the same path
-	// when loading roots from CCADB (periodically and on SIGHUP). Optional.
-	//
-	// Once added, roots are never removed for the lifespan of a log.
-	ExtraRoots string
-
-	// Secret is the path to a file containing a secret seed from which the
-	// log's private keys are derived. The file contents are used as HKDF input.
-	// It must be exactly 32 bytes long.
-	//
-	// To generate a new seed, run:
-	//
-	//   $ sunlight-keygen -f seed.bin
-	//
-	Secret string
-
-	// Seed is a legacy name for the Secret field.
-	//
-	// Deprecated: use Secret instead.
-	Seed string
-
-	// Cache is the path to the SQLite deduplication cache file. It will be
-	// created if it doesn't already exist.
-	Cache string
-
-	// PoolSize is the maximum number of chains pending in the sequencing pool.
-	// Since the pool is sequenced every Period, it works as a qps limit. If the
-	// pool is full, lower-priority entries will be evicted and replaced if
-	// possible, and otherwise add-chain requests will be rejected with a 503.
-	// Lower-priority entries are precertificates with NotBefore more than 48h
-	// in the past, or certificates with an SCT extension. Zero means no limit.
-	PoolSize int
-
-	// S3Region is the AWS region for the S3 bucket.
-	S3Region string
-
-	// S3Bucket is the name of the S3 bucket. This bucket must be dedicated to
-	// this specific log instance.
-	//
-	// Only one of S3Bucket or LocalDirectory can be set at the same time.
-	S3Bucket string
-
-	// S3Endpoint is the base URL the AWS SDK will use to connect to S3. Optional.
-	S3Endpoint string
-
-	// S3KeyPrefix is a prefix on all keys written to S3. Optional.
-	//
-	// S3 doesn't have directories, but using a prefix ending in a "/" is
-	// going to be treated like a directory in many tools using S3.
-	S3KeyPrefix string
-
-	// LocalDirectory is the path to a local directory where the log will store
-	// its data. It must be dedicated to this specific log instance. It will
-	// be created if it doesn't already exist.
-	//
-	// Only one of S3Bucket or LocalDirectory can be set at the same time.
-	LocalDirectory string
-
-	// NotAfterStart is the start of the validity range for certificates
-	// accepted by this log instance, as and RFC 3339 date.
-	NotAfterStart string
-
-	// NotAfterLimit is the end of the validity range (not included) for
-	// certificates accepted by this log instance, as and RFC 3339 date.
-	NotAfterLimit string
+	Secret           string
+	Seed             string
+	Cache            string
+	PoolSize         int
+	S3Region         string
+	S3Bucket         string
+	S3Endpoint       string
+	S3KeyPrefix      string
+	LocalDirectory   string
 }
 
-// logInfo is used on the homepage and for /log.v3.json. The JSON schema is from
-// https://www.gstatic.com/ct/log_list/v3/log_list_schema.json with additions from
-// https://docs.google.com/document/d/1KIBO8OjTHcmf6e2OsEGYanovC9LWIQL6sS9N8XODmt4/edit.
 type logInfo struct {
-	// Fields from LogConfig, we don't embed the whole struct to avoid
-	// accidentally exposing sensitive fields.
 	Name             string `json:"description"`
 	ShortName        string `json:"friendly_name"`
-	SubmissionPrefix string `json:"submission_url"` // with trailing slash
-	MonitoringPrefix string `json:"monitoring_url"` // with trailing slash
-	PoolSize         int    `json:"-"`
-	Interval         struct {
-		NotAfterStart string `json:"start_inclusive"`
-		NotAfterLimit string `json:"end_exclusive"`
-	} `json:"temporal_interval"`
-
-	// ID is the base64 encoded SHA-256 of the public key.
-	ID string `json:"log_id"`
-
-	// PublicKeyPEM, PublicKeyDER, and PublicKeyBase64 are the
-	// SubjectPublicKeyInfo in various encodings.
-	PublicKeyPEM    string `json:"-"`
-	PublicKeyDER    []byte `json:"key"`
-	PublicKeyBase64 string `json:"-"`
-
-	// MMD is always 60 seconds but note that Sunlight logs have zero MMD.
-	MMD int `json:"mmd"`
-
-	// Fields from the "Operator-published CT Log Metadata" proposal.
-	TLSOnly     bool     `json:"tls_only"`              // always true
-	IntendedUse string   `json:"intended_use,omitzero"` // "production" or "test"
-	FinalTree   struct { // only included for sunsetted logs
-		RootHash  []byte `json:"sha256_root_hash"`
-		Size      int64  `json:"tree_size"`
-		Timestamp int64  `json:"timestamp"`
-	} `json:"final_tree_head,omitzero"`
-	Software struct {
+	SubmissionPrefix string `json:"submission_url"`
+	MonitoringPrefix string `json:"monitoring_url"`
+	PoolSize         int    `json:"pool_size"`
+	ID               string `json:"log_id"`
+	PublicKeyPEM     string `json:"public_key_pem,omitempty"`
+	PublicKeyDER     []byte `json:"public_key_der,omitempty"`
+	PublicKeyBase64  string `json:"public_key_base64,omitempty"`
+	Software         struct {
 		Name    string `json:"name"`
 		Version string `json:"version"`
 	} `json:"log_software"`
@@ -351,7 +111,7 @@ var homeTmpl = template.Must(template.New("home").Parse(homeHTML))
 func main() {
 	fs := flag.NewFlagSet("sunlight", flag.ExitOnError)
 	configFlag := fs.String("c", "sunlight.yaml", "path to the config file")
-	testCertFlag := fs.Bool("testcert", false, "use sunlight.pem and sunlight-key.pem instead of ACME")
+	testCertFlag := fs.Bool("testcert", false, "use test certificate")
 	fs.Parse(os.Args[1:])
 
 	logger := slog.New(stdlog.Handler)
@@ -378,7 +138,6 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		// TODO: print total certificates serialized in last 60s.
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -402,12 +161,12 @@ func main() {
 	case c.Checkpoints != "" && c.DynamoDB.Table != "" ||
 		c.Checkpoints != "" && c.ETagS3.Bucket != "" ||
 		c.DynamoDB.Table != "" && c.ETagS3.Bucket != "":
-		fatalError(logger, "only one of Checkpoints, DynamoDB, or ETagS3 can be set at the same time")
+		fatalError(logger, "only one of Checkpoints, DynamoDB, or ETagS3 can be set")
 
 	case c.Checkpoints != "":
 		b, err := ctlog.NewSQLiteBackend(ctx, c.Checkpoints, logger)
 		if err != nil {
-			fatalError(logger, "failed to create SQLite checkpoint backend", "err", err)
+			fatalError(logger, "failed to create SQLite backend", "err", err)
 		}
 		sunlightMetrics.MustRegister(b.Metrics()...)
 		db = b
@@ -431,13 +190,13 @@ func main() {
 		db = b
 
 	default:
-		fatalError(logger, "neither Checkpoints nor DynamoDB are set, one must be used")
+		fatalError(logger, "neither Checkpoints nor DynamoDB are set")
 	}
 
 	sequencerGroup, sequencerContext := errgroup.WithContext(ctx)
 
 	var logsMu sync.RWMutex
-	logs := make(map[string]logInfo) // short name => log info
+	logs := make(map[string]logInfo)
 	homeLogsInfo := func() []logInfo {
 		logsMu.RLock()
 		defer logsMu.RUnlock()
@@ -456,14 +215,10 @@ func main() {
 		defer logsMu.Unlock()
 		logs[shortName] = li
 	}
-	type witnessInfo struct {
-		Name             string
-		SubmissionPrefix string
-		VerifierKey      string
-		LogLists         []string
-		Logs             []string
-	}
+
+	type witnessInfo struct{}
 	homeWitnessInfo := func() witnessInfo { return witnessInfo{} }
+
 	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		if err := homeTmpl.Execute(w, struct {
@@ -492,7 +247,7 @@ func main() {
 		var b ctlog.Backend
 		switch {
 		case lc.S3Bucket != "" && lc.LocalDirectory != "":
-			fatalError(logger, "only one of S3Bucket or LocalDirectory can be set at the same time")
+			fatalError(logger, "only one of S3Bucket or LocalDirectory can be set")
 		case lc.S3Bucket != "":
 			b, err = ctlog.NewS3Backend(ctx, lc.S3Region, lc.S3Bucket, lc.S3Endpoint, lc.S3KeyPrefix, logger)
 			if err != nil {
@@ -504,7 +259,7 @@ func main() {
 				fatalError(logger, "failed to create backend", "err", err)
 			}
 		default:
-			fatalError(logger, "neither S3Bucket nor LocalDirectory are set, one must be used")
+			fatalError(logger, "neither S3Bucket nor LocalDirectory are set")
 		}
 
 		if lc.Secret == "" && lc.Seed != "" {
@@ -526,29 +281,6 @@ func main() {
 		k, err := keygen.ECDSA(elliptic.P256(), ecdsaSecret)
 		if err != nil {
 			fatalError(logger, "failed to generate ECDSA key", "err", err)
-		}
-
-		ed25519Secret := make([]byte, ed25519.SeedSize)
-		if _, err := io.ReadFull(hkdf.New(sha256.New, seed, []byte("sunlight"), []byte("Ed25519 log key")), ed25519Secret); err != nil {
-			fatalError(logger, "failed to derive Ed25519 key", "err", err)
-		}
-		wk := ed25519.NewKeyFromSeed(ed25519Secret)
-
-		// Compare the checkpoint from the Backend with the one accessible over
-		// the MonitoringPrefix, to catch misconfigurations. We ignore failures
-		// to fetch from the backend, as the log might not exist yet.
-		if exp, err := b.Fetch(ctx, "checkpoint"); err == nil &&
-			!bytes.Equal(fetchCheckpoint(ctx, logger, lc.MonitoringPrefix), exp) {
-			fatalError(logger, "checkpoints from Backend and MonitoringPrefix don't match")
-		}
-
-		notAfterStart, err := time.Parse(time.RFC3339, lc.NotAfterStart)
-		if err != nil {
-			fatalError(logger, "failed to parse NotAfterStart", "err", err)
-		}
-		notAfterLimit, err := time.Parse(time.RFC3339, lc.NotAfterLimit)
-		if err != nil {
-			fatalError(logger, "failed to parse NotAfterLimit", "err", err)
 		}
 
 		lc.SubmissionPrefix = strings.TrimSuffix(lc.SubmissionPrefix, "/")
@@ -577,16 +309,13 @@ func main() {
 		}
 
 		cc := &ctlog.Config{
-			Name:          prefix.Host + prefix.Path,
-			Key:           k,
-			WitnessKey:    wk,
-			Cache:         lc.Cache,
-			PoolSize:      lc.PoolSize,
-			Backend:       b,
-			Lock:          db,
-			Log:           logger,
-			NotAfterStart: notAfterStart,
-			NotAfterLimit: notAfterLimit,
+			Name:     prefix.Host + prefix.Path,
+			Key:      k,
+			Cache:    lc.Cache,
+			PoolSize: lc.PoolSize,
+			Backend:  b,
+			Lock:     db,
+			Log:      logger,
 		}
 
 		if time.Now().Format(time.DateOnly) == lc.Inception {
@@ -607,207 +336,31 @@ func main() {
 		}
 		defer l.CloseCache()
 
-		reloadChan := make(chan os.Signal, 1)
-		signal.Notify(reloadChan, syscall.SIGHUP)
-		if lc.Roots != "" {
-			if lc.CCADBRoots != "" || lc.ExtraRoots != "" {
-				fatalError(logger, "can't set both Roots and CCADBRoots or ExtraRoots")
-			}
-			if err := loadRoots(ctx, lc, l); err != nil {
-				fatalError(logger, "failed to load Roots", "file", lc.Roots, "err", err)
-			}
-			serveGroup.Go(func() error {
-				for {
-					select {
-					case <-ctx.Done():
-						return ctx.Err()
-					case <-reloadChan:
-					}
-					if err := loadRoots(ctx, lc, l); err != nil {
-						logger.Error("failed to reload Roots on SIGHUP", "file", lc.Roots, "err", err)
-						continue
-					}
-					logger.Info("successfully reloaded roots on SIGHUP", "file", lc.Roots)
-				}
-			})
-		} else {
-			switch lc.CCADBRoots {
-			case "trusted", "testing", "":
-			default:
-				fatalError(logger, "CCADBRoots must be 'trusted', 'testing', or empty",
-					"CCADBRoots", lc.CCADBRoots)
-			}
-			serveGroup.Go(func() error {
-				if newRoots, err := loadCCADBRoots(ctx, lc, l); err != nil {
-					logger.Error("failed to load initial CCADB roots", "err", err)
-				} else if newRoots {
-					logger.Info("successfully loaded new roots from CCADB/ExtraRoots")
-				}
-				ticker := time.NewTicker(15 * time.Minute)
-				for {
-					select {
-					case <-ctx.Done():
-						return ctx.Err()
-					case <-reloadChan:
-					case <-ticker.C:
-					}
-					if newRoots, err := loadCCADBRoots(ctx, lc, l); err != nil {
-						logger.Error("failed to reload CCADB roots", "err", err)
-					} else if newRoots {
-						logger.Info("successfully loaded new roots from CCADB/ExtraRoots on SIGHUP or timer")
-					}
-				}
-			})
+		if err := updateMetadata(ctx, setLogInfo, lc, cc); err != nil {
+			fatalError(logger, "failed to update log metadata", "err", err)
 		}
+		period := 1 * time.Second
+		if lc.Period > 0 {
+			period = time.Duration(lc.Period) * time.Millisecond
+		}
+		sequencerGroup.Go(func() error {
+			return l.RunSequencer(sequencerContext, period)
+		})
 
-		// Do some consistency checking on the stored log.v3.json file, if any.
-		if j, err := b.Fetch(ctx, "log.v3.json"); err == nil {
-			var got logInfo
-			if err := json.Unmarshal(j, &got); err != nil {
-				fatalError(logger, "failed to parse stored log.v3.json", "err", err)
-			}
-			if got.ShortName != "" && got.ShortName != lc.ShortName {
-				fatalError(logger, "stored log.v3.json has mismatching short name",
-					"want", lc.ShortName, "got", got.ShortName)
-			}
-			if got.FinalTree.RootHash != nil && l.AcceptingSubmissions() {
-				fatalError(logger, "stored log.v3.json shows log is sunsetted, but log is accepting submissions")
-			}
-		}
-
-		if l.AcceptingSubmissions() {
-			if err := updateMetadata(ctx, setLogInfo, lc, cc, nil); err != nil {
-				fatalError(logger, "failed to update log metadata", "err", err)
-			}
-			period := 1 * time.Second
-			if lc.Period > 0 {
-				period = time.Duration(lc.Period) * time.Millisecond
-			}
-			sequencerGroup.Go(func() error {
-				err := l.RunSequencer(sequencerContext, period)
-				if e := new(ctlog.SunsetLogError); errors.As(err, e) {
-					// Update log.v3.json with the new state and final checkpoint.
-					return updateMetadata(sequencerContext, setLogInfo, lc, cc, e)
-				}
-				return err
-			})
-		} else {
-			// Run the sequencer, which will immediately exit and return the
-			// final checkpoint. We do this to avoid synchronizing access to the
-			// sequencing loop state.
-			err := l.RunSequencer(sequencerContext, 10*time.Nanosecond)
-			sunsetErr := new(ctlog.SunsetLogError)
-			if !errors.As(err, sunsetErr) {
-				fatalError(logger, "log not accepting submissions but not sunsetted?", "err", err)
-			}
-			if err := updateMetadata(sequencerContext, setLogInfo, lc, cc, sunsetErr); err != nil {
-				fatalError(logger, "failed to update log metadata", "err", err)
-			}
-			logger.Info("log is not accepting submissions (sunsetted)",
-				"tree_size", sunsetErr.FinalTree.N, "timestamp", sunsetErr.FinalTimestamp)
-		}
-		mux.Handle(prefix.Host+prefix.Path+"/ct/v1/", http.StripPrefix(prefix.Path, l.Handler()))
+		mux.Handle(prefix.Host+prefix.Path+"/", http.StripPrefix(prefix.Path, l.Handler()))
 
 		acmeHosts = append(acmeHosts, prefix.Hostname())
 
 		prometheus.WrapRegistererWith(prometheus.Labels{"log": lc.ShortName}, sunlightMetrics).
 			MustRegister(l.Metrics()...)
 
-		mux.HandleFunc(prefix.Host+prefix.Path+"/log.v3.json", func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc(prefix.Host+prefix.Path+"/log.json", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			li, _ := logInfoForShortName(lc.ShortName)
 			e := json.NewEncoder(w)
 			e.SetIndent("", "    ")
 			e.Encode(li)
 		})
-	}
-
-	if c.Witness.Name != "" {
-		logger := slog.New(stdlog.Handler.WithAttrs([]slog.Attr{
-			slog.String("witness", c.Witness.Name),
-		}))
-
-		seed, err := os.ReadFile(c.Witness.Secret)
-		if err != nil {
-			fatalError(logger, "failed to load witness seed", "err", err)
-		}
-		if len(seed) != 32 {
-			fatalError(logger, "witness seed file must be exactly 32 bytes")
-		}
-
-		ed25519Secret := make([]byte, ed25519.SeedSize)
-		if _, err := io.ReadFull(hkdf.New(sha256.New, seed, []byte("sunlight Ed25519 witness key"),
-			[]byte(c.Witness.Name)), ed25519Secret); err != nil {
-			fatalError(logger, "failed to derive Ed25519 key", "err", err)
-		}
-		wk := ed25519.NewKeyFromSeed(ed25519Secret)
-
-		w, err := witness.NewWitness(ctx, &witness.Config{
-			Name:    c.Witness.Name,
-			Key:     wk,
-			Backend: db,
-			Log:     logger,
-		})
-		if err != nil {
-			fatalError(logger, "failed to create witness", "err", err)
-		}
-
-		reloadChan := make(chan os.Signal, 1)
-		signal.Notify(reloadChan, syscall.SIGHUP)
-		serveGroup.Go(func() error {
-			for _, url := range c.Witness.LogLists {
-				if err := w.PullLogList(ctx, url); err != nil {
-					logger.Error("failed to pull log list", "list", url, "err", err)
-				}
-			}
-			ticker := time.NewTicker(15 * time.Minute)
-			for {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-reloadChan:
-				case <-ticker.C:
-				}
-				for _, url := range c.Witness.LogLists {
-					if err := w.PullLogList(ctx, url); err != nil {
-						logger.Error("failed to pull log list", "list", url, "err", err)
-					}
-				}
-			}
-		})
-
-		if c.Witness.SubmissionPrefix == "" {
-			c.Witness.SubmissionPrefix = "https://" + c.Witness.Name
-		}
-		c.Witness.SubmissionPrefix = strings.TrimSuffix(c.Witness.SubmissionPrefix, "/")
-		prefix, err := url.Parse(c.Witness.SubmissionPrefix)
-		if err != nil {
-			fatalError(logger, "failed to parse SubmissionPrefix", "err", err)
-		}
-		if prefix.Scheme != "https" {
-			fatalError(logger, "SubmissionPrefix must be an https URL",
-				"prefix", c.Witness.SubmissionPrefix)
-		}
-		if prefix.Host == "" {
-			fatalError(logger, "SubmissionPrefix must have a host",
-				"prefix", c.Witness.SubmissionPrefix)
-		}
-		mux.Handle(prefix.Host+prefix.Path+"/", http.StripPrefix(prefix.Path, w.Handler()))
-
-		acmeHosts = append(acmeHosts, prefix.Host)
-
-		witnessMetrics := prometheus.WrapRegistererWithPrefix("witness_", sunlightMetrics)
-		witnessMetrics.MustRegister(w.Metrics()...)
-
-		homeWitnessInfo = func() witnessInfo {
-			return witnessInfo{
-				Name:             c.Witness.Name,
-				SubmissionPrefix: c.Witness.SubmissionPrefix,
-				VerifierKey:      w.VerifierKey(),
-				LogLists:         c.Witness.LogLists,
-				Logs:             w.Logs(),
-			}
-		}
 	}
 
 	handler := reused.NewHandler(mux)
@@ -848,7 +401,7 @@ func main() {
 	}
 
 	if len(c.Listen) == 0 {
-		fatalError(logger, "no Listen addresses specified in config")
+		fatalError(logger, "no Listen addresses specified")
 	}
 	for _, addr := range c.Listen {
 		l, err := net.Listen("tcp", addr)
@@ -880,7 +433,7 @@ func main() {
 	os.Exit(1)
 }
 
-func updateMetadata(ctx context.Context, setLogInfo func(string, logInfo), lc LogConfig, cc *ctlog.Config, e *ctlog.SunsetLogError) error {
+func updateMetadata(ctx context.Context, setLogInfo func(string, logInfo), lc LogConfig, cc *ctlog.Config) error {
 	pkix, err := x509.MarshalPKIXPublicKey(&cc.Key.PublicKey)
 	if err != nil {
 		return err
@@ -897,23 +450,6 @@ func updateMetadata(ctx context.Context, setLogInfo func(string, logInfo), lc Lo
 		PublicKeyPEM:     string(pemKey),
 		PublicKeyDER:     pkix,
 		PublicKeyBase64:  base64.StdEncoding.EncodeToString(pkix),
-		MMD:              60,
-		TLSOnly:          true,
-	}
-	log.Interval.NotAfterStart = lc.NotAfterStart
-	log.Interval.NotAfterLimit = lc.NotAfterLimit
-	switch {
-	case lc.Roots != "":
-		// No IntendedUse for custom roots.
-	case lc.CCADBRoots == "trusted" || lc.CCADBRoots == "":
-		log.IntendedUse = "production"
-	case lc.CCADBRoots == "testing":
-		log.IntendedUse = "test"
-	}
-	if e != nil {
-		log.FinalTree.RootHash = e.FinalTree.Hash[:]
-		log.FinalTree.Size = e.FinalTree.N
-		log.FinalTree.Timestamp = e.FinalTimestamp
 	}
 	info, _ := debug.ReadBuildInfo()
 	log.Software.Name = info.Main.Path
@@ -925,30 +461,7 @@ func updateMetadata(ctx context.Context, setLogInfo func(string, logInfo), lc Lo
 	if err != nil {
 		return err
 	}
-	return cc.Backend.Upload(ctx, "log.v3.json", j, &ctlog.UploadOptions{ContentType: "application/json"})
-}
-
-func fetchCheckpoint(ctx context.Context, logger *slog.Logger, prefix string) []byte {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", prefix+"/checkpoint", nil)
-	if err != nil {
-		fatalError(logger, "failed to create request", "err", err)
-	}
-	req.Header.Set("User-Agent", "+https://filippo.io/sunlight")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		fatalError(logger, "failed to fetch checkpoint from MonitoringPrefix", "err", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		fatalError(logger, "failed to fetch checkpoint from MonitoringPrefix", "status", resp.Status)
-	}
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fatalError(logger, "failed to read checkpoint body", "err", err)
-	}
-	return b
+	return cc.Backend.Upload(ctx, "log.json", j, &ctlog.UploadOptions{ContentType: "application/json"})
 }
 
 func fatalError(logger *slog.Logger, msg string, args ...any) {

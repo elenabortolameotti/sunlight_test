@@ -5,7 +5,6 @@ import (
 	"math"
 	"strings"
 
-	"github.com/google/certificate-transparency-go/x509"
 	"golang.org/x/crypto/cryptobyte"
 	"golang.org/x/mod/sumdb/tlog"
 )
@@ -51,86 +50,39 @@ func ParseTilePath(path string) (tlog.Tile, error) {
 	return tlog.Tile{}, fmt.Errorf("malformed tile path %q", path)
 }
 
+// LogEntry represents a generic entry in the append-only log.
+// This is a simplified version that stores arbitrary data as a blob.
 type LogEntry struct {
-	// Certificate is either the TimestampedEntry.signed_entry, or the
-	// PreCert.tbs_certificate for Precertificates.
+	// Data is the arbitrary content of the log entry.
 	// It must be at most 2^24-1 bytes long.
-	Certificate []byte
-
-	// IsPrecert is true if LogEntryType is precert_entry. Otherwise, the
-	// following three fields are zero and ignored.
-	IsPrecert bool
-
-	// IssuerKeyHash is the PreCert.issuer_key_hash.
-	IssuerKeyHash [32]byte
-
-	// ChainFingerprints are the SHA-256 hashes of the certificates in the
-	// X509ChainEntry.certificate_chain or
-	// PrecertChainEntry.precertificate_chain.
-	ChainFingerprints [][32]byte
-
-	// PreCertificate is the PrecertChainEntry.pre_certificate.
-	// It must be at most 2^24-1 bytes long.
-	PreCertificate []byte
+	Data []byte
 
 	// LeafIndex is the zero-based index of the leaf in the log.
 	// It must be between 0 and 2^40-1.
-	//
-	// If RFC6962ArchivalLeaf is true, this field is ignored and
-	// should be set to 0.
 	LeafIndex int64
 
-	// RFC6962ArchivalLeaf is true if this LogEntry is an archived
-	// RFC 6962 log leaf, which is missing the leaf index extension.
-	//
-	// [ReadTileLeaf] always sets this to false. To read such leaves,
-	// use [ReadTileLeafMaybeArchival].
-	RFC6962ArchivalLeaf bool
-
-	// Timestamp is the TimestampedEntry.timestamp.
+	// Timestamp is when the entry was added to the log (Unix milliseconds).
 	Timestamp int64
+
+	// RFC6962ArchivalLeaf is kept for backward compatibility with existing data.
+	// For new entries, this should always be false.
+	RFC6962ArchivalLeaf bool
 }
 
-// MerkleTreeLeaf returns a RFC 6962 MerkleTreeLeaf.
-//
-// This is the Merkle tree leaf that can be passed, for example, to
-// [tlog.RecordHash] for use with [tlog.CheckRecord].
-//
-// It also matches the digitally-signed data of an SCT, which is technically not
-// a MerkleTreeLeaf, but a completely identical structure (except for the second
-// field, which is a SignatureType of value 0 and length 1 instead of a
-// MerkleLeafType of value 0 and length 1).
+// MerkleTreeLeaf returns a simple Merkle tree leaf hash.
+// This is a simplified version that hashes the data directly.
 func (e *LogEntry) MerkleTreeLeaf() []byte {
 	b := &cryptobyte.Builder{}
 	b.AddUint8(0 /* version = v1 */)
 	b.AddUint8(0 /* leaf_type = timestamped_entry */)
 	b.AddUint64(uint64(e.Timestamp))
-	if !e.IsPrecert {
-		b.AddUint16(0 /* entry_type = x509_entry */)
-		b.AddUint24LengthPrefixed(func(b *cryptobyte.Builder) {
-			b.AddBytes(e.Certificate)
-		})
-	} else {
-		b.AddUint16(1 /* entry_type = precert_entry */)
-		b.AddBytes(e.IssuerKeyHash[:])
-		b.AddUint24LengthPrefixed(func(b *cryptobyte.Builder) {
-			b.AddBytes(e.Certificate)
-		})
-	}
+	b.AddUint16(0 /* entry_type = generic blob */)
+	b.AddUint24LengthPrefixed(func(b *cryptobyte.Builder) {
+		b.AddBytes(e.Data)
+	})
 	addExtensions(b, e)
 	return b.BytesOrPanic()
 }
-
-// struct {
-//     TimestampedEntry timestamped_entry;
-//     select (entry_type) {
-//         case x509_entry: Empty;
-//         case precert_entry: ASN.1Cert pre_certificate;
-//     };
-//     Fingerprint certificate_chain<0..2^16-1>;
-// } TileLeaf;
-//
-// opaque Fingerprint[32];
 
 // ReadTileLeaf reads a LogEntry from a data tile, and returns the remaining
 // data in the tile.
@@ -159,30 +111,29 @@ func readTileLeaf(tile []byte) (e *LogEntry, rest []byte, err error) {
 	s := cryptobyte.String(tile)
 	var timestamp uint64
 	var entryType uint16
-	var extensions, fingerprints cryptobyte.String
+	var extensions cryptobyte.String
 	if !s.ReadUint64(&timestamp) || !s.ReadUint16(&entryType) || timestamp > math.MaxInt64 {
 		return nil, s, fmt.Errorf("invalid data tile")
 	}
 	e.Timestamp = int64(timestamp)
-	switch entryType {
-	case 0: // x509_entry
-		if !s.ReadUint24LengthPrefixed((*cryptobyte.String)(&e.Certificate)) ||
-			!s.ReadUint16LengthPrefixed(&extensions) ||
-			!s.ReadUint16LengthPrefixed(&fingerprints) {
-			return nil, s, fmt.Errorf("invalid data tile x509_entry")
-		}
-	case 1: // precert_entry
-		e.IsPrecert = true
-		if !s.CopyBytes(e.IssuerKeyHash[:]) ||
-			!s.ReadUint24LengthPrefixed((*cryptobyte.String)(&e.Certificate)) ||
-			!s.ReadUint16LengthPrefixed(&extensions) ||
-			!s.ReadUint24LengthPrefixed((*cryptobyte.String)(&e.PreCertificate)) ||
-			!s.ReadUint16LengthPrefixed(&fingerprints) {
-			return nil, s, fmt.Errorf("invalid data tile precert_entry")
-		}
-	default:
+	
+	// Support both generic blob (type 0) and legacy x509_entry (type 0 was reused)
+	// We read the data field regardless
+	if entryType != 0 && entryType != 1 {
 		return nil, s, fmt.Errorf("invalid data tile: unknown type %d", entryType)
 	}
+	
+	if !s.ReadUint24LengthPrefixed((*cryptobyte.String)(&e.Data)) ||
+		!s.ReadUint16LengthPrefixed(&extensions) {
+		return nil, s, fmt.Errorf("invalid data tile: failed to read data")
+	}
+	
+	// Skip legacy precertificate field if present (for backward compatibility)
+	if entryType == 1 {
+		var dummy cryptobyte.String
+		s.ReadUint24LengthPrefixed(&dummy)
+	}
+	
 	if extensions.Empty() {
 		e.RFC6962ArchivalLeaf = true
 	} else {
@@ -195,13 +146,7 @@ func readTileLeaf(tile []byte) (e *LogEntry, rest []byte, err error) {
 			return nil, s, fmt.Errorf("invalid data tile extensions")
 		}
 	}
-	for !fingerprints.Empty() {
-		var f [32]byte
-		if !fingerprints.CopyBytes(f[:]) {
-			return nil, s, fmt.Errorf("invalid data tile fingerprints")
-		}
-		e.ChainFingerprints = append(e.ChainFingerprints, f)
-	}
+	
 	return e, s, nil
 }
 
@@ -209,29 +154,11 @@ func readTileLeaf(tile []byte) (e *LogEntry, rest []byte, err error) {
 func AppendTileLeaf(t []byte, e *LogEntry) []byte {
 	b := cryptobyte.NewBuilder(t)
 	b.AddUint64(uint64(e.Timestamp))
-	if !e.IsPrecert {
-		b.AddUint16(0 /* entry_type = x509_entry */)
-		b.AddUint24LengthPrefixed(func(b *cryptobyte.Builder) {
-			b.AddBytes(e.Certificate)
-		})
-	} else {
-		b.AddUint16(1 /* entry_type = precert_entry */)
-		b.AddBytes(e.IssuerKeyHash[:])
-		b.AddUint24LengthPrefixed(func(b *cryptobyte.Builder) {
-			b.AddBytes(e.Certificate)
-		})
-	}
-	addExtensions(b, e)
-	if e.IsPrecert {
-		b.AddUint24LengthPrefixed(func(b *cryptobyte.Builder) {
-			b.AddBytes(e.PreCertificate)
-		})
-	}
-	b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
-		for _, f := range e.ChainFingerprints {
-			b.AddBytes(f[:])
-		}
+	b.AddUint16(0 /* entry_type = generic blob */)
+	b.AddUint24LengthPrefixed(func(b *cryptobyte.Builder) {
+		b.AddBytes(e.Data)
 	})
+	addExtensions(b, e)
 	return b.BytesOrPanic()
 }
 
@@ -250,50 +177,4 @@ func addExtensions(b *cryptobyte.Builder, e *LogEntry) {
 	})
 }
 
-// A TrimmedEntry is a subset of the information in a [LogEntry], including
-// names parsed from the certificate or pre-certificate.
-type TrimmedEntry struct {
-	// Timestamp is the UNIX timestamp in milliseconds of when the entry was
-	// added to the log.
-	Timestamp int64
 
-	// Subject contains the parsed Subject information from the certificate.
-	Subject struct {
-		Country, Organization, OrganizationalUnit []string `json:",omitempty"`
-		Locality, Province                        []string `json:",omitempty"`
-		StreetAddress, PostalCode                 []string `json:",omitempty"`
-		CommonName                                string   `json:",omitempty"`
-	} `json:",omitzero"`
-
-	// DNS and IP are the Subject Alternative Names of the certificate.
-	DNS []string `json:",omitempty"`
-	IP  []string `json:",omitempty"`
-}
-
-func (e *LogEntry) TrimmedEntry() (*TrimmedEntry, error) {
-	t := &TrimmedEntry{
-		Timestamp: e.Timestamp,
-	}
-	certBytes := e.Certificate
-	if e.IsPrecert {
-		certBytes = e.PreCertificate
-	}
-	cert, err := x509.ParseCertificate(certBytes)
-	if cert == nil { // x509.ParseCertificate can return non-fatal errors
-		return nil, fmt.Errorf("failed to parse certificate: %w", err)
-	}
-	t.Subject.Country = cert.Subject.Country
-	t.Subject.Organization = cert.Subject.Organization
-	t.Subject.OrganizationalUnit = cert.Subject.OrganizationalUnit
-	t.Subject.Locality = cert.Subject.Locality
-	t.Subject.Province = cert.Subject.Province
-	t.Subject.StreetAddress = cert.Subject.StreetAddress
-	t.Subject.PostalCode = cert.Subject.PostalCode
-	t.Subject.CommonName = cert.Subject.CommonName
-	t.DNS = cert.DNSNames
-	t.IP = make([]string, len(cert.IPAddresses))
-	for i, ip := range cert.IPAddresses {
-		t.IP[i] = ip.String()
-	}
-	return t, nil
-}

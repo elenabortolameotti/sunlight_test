@@ -12,11 +12,7 @@ var ErrPoolFull = errPoolFull
 type WaitEntryFunc = waitEntryFunc
 
 func (l *Log) AddLeafToPool(e *PendingLogEntry) (WaitEntryFunc, string) {
-	return l.addLeafToPool(context.Background(), e, false)
-}
-
-func (l *Log) AddLeafToPoolWithLowPriority(e *PendingLogEntry) (WaitEntryFunc, string) {
-	return l.addLeafToPool(context.Background(), e, true)
+	return l.addLeafToPool(context.Background(), e)
 }
 
 func (l *Log) Sequence() error {

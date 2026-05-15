@@ -7,9 +7,11 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,7 +19,9 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"math/big"
 	mathrand "math/rand/v2"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +29,7 @@ import (
 	"crawshaw.io/sqlite"
 	"filippo.io/sunlight"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/mod/sumdb/note"
 	"golang.org/x/mod/sumdb/tlog"
 	"golang.org/x/sync/errgroup"
 )
@@ -68,13 +73,14 @@ func (t tileWithBytes) String() string {
 }
 
 type Config struct {
-	Name    string
-	Key     *ecdsa.PrivateKey
-	PoolSize int
-	Cache    string
-	Backend  Backend
-	Lock     LockBackend
-	Log      *slog.Logger
+	Name       string
+	Key        *ecdsa.PrivateKey
+	PoolSize   int
+	Cache      string
+	Backend    Backend
+	Lock       LockBackend
+	Log        *slog.Logger
+	EntityKeys map[string]ed25519.PublicKey // Optional: override hardcoded entity keys
 }
 
 var ErrLogExists = errors.New("checkpoint already exist, refusing to initialize log")
@@ -245,11 +251,15 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 	m.TreeSize.Set(float64(c.N))
 	m.TreeTime.Set(float64(timestamp))
 
-	// Initialize hardcoded entity keys
-	// TODO: Make this configurable in the future
-	entityKeys := map[string]ed25519.PublicKey{
-		"witness-1": mustDecodeKey("2f8c2b3e4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1"),
-		"client-a":  mustDecodeKey("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b"),
+	// Initialize entity keys - use config if provided, otherwise use hardcoded defaults
+	var entityKeys map[string]ed25519.PublicKey
+	if config.EntityKeys != nil {
+		entityKeys = config.EntityKeys
+	} else {
+		entityKeys = map[string]ed25519.PublicKey{
+			"witness-1": mustDecodeKey("2f8c2b3e4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1"),
+			"client-a":  mustDecodeKey("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b"),
+		}
 	}
 
 	return &Log{
@@ -273,7 +283,19 @@ func mustDecodeKey(hexStr string) ed25519.PublicKey {
 }
 
 func openCheckpoint(config *Config, b []byte) (sunlight.Checkpoint, int64, error) {
-	c, err := sunlight.ParseCheckpoint(string(b))
+	// The input is a signed note. First, we need to extract just the checkpoint text
+	// (before the blank line and signatures), then parse it.
+	s := string(b)
+
+	// Find the blank line that separates the text from the signatures
+	idx := strings.Index(s, "\n\n")
+	if idx == -1 {
+		return sunlight.Checkpoint{}, 0, fmt.Errorf("malformed signed note: no signature separator")
+	}
+
+	checkpointText := s[:idx+1] // Include the trailing newline
+
+	c, err := sunlight.ParseCheckpoint(checkpointText)
 	if err != nil {
 		return sunlight.Checkpoint{}, 0, fmt.Errorf("couldn't parse checkpoint: %w", err)
 	}
@@ -353,9 +375,9 @@ type PendingLogEntry struct {
 
 func (e *PendingLogEntry) asLogEntry(idx, timestamp int64) *sunlight.LogEntry {
 	return &sunlight.LogEntry{
-		Data:        e.Data,
-		LeafIndex:   idx,
-		Timestamp:   timestamp,
+		Data:      e.Data,
+		LeafIndex: idx,
+		Timestamp: timestamp,
 	}
 }
 
@@ -367,13 +389,13 @@ func computeCacheHash(data []byte) cacheHash {
 }
 
 type pool struct {
-	pendingLeaves []*PendingLogEntry
-	byHash        map[cacheHash]waitEntryFunc
-	lowPriority   map[int]func()
-	done          chan struct{}
-	err           error
+	pendingLeaves  []*PendingLogEntry
+	byHash         map[cacheHash]waitEntryFunc
+	lowPriority    map[int]func()
+	done           chan struct{}
+	err            error
 	firstLeafIndex int64
-	timestamp     int64
+	timestamp      int64
 }
 
 type waitEntryFunc func(ctx context.Context) (*sunlight.LogEntry, error)
@@ -770,7 +792,106 @@ func legacyStagingPath(tree tlog.Tree) string {
 }
 
 func signTreeHead(c *Config, tree treeWithTimestamp) (checkpoint []byte, err error) {
-	return nil, nil
+	// Create a simple checkpoint (no extension for now)
+	cp := sunlight.Checkpoint{
+		Origin: c.Name,
+		Tree:   tlog.Tree{N: tree.N, Hash: tree.Hash},
+	}
+
+	// Format the checkpoint text
+	text := sunlight.FormatCheckpoint(cp)
+
+	// Create a simple ECDSA signer
+	signer, err := newECDSASigner(c.Name, c.Key, tree.Time)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't create signer: %w", err)
+	}
+
+	// Sign the checkpoint
+	signedNote, err := note.Sign(&note.Note{Text: text}, signer)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't sign checkpoint: %w", err)
+	}
+
+	return signedNote, nil
+}
+
+// ecdsaSigner implements note.Signer for ECDSA keys
+type ecdsaSigner struct {
+	name      string
+	keyHash   uint32
+	key       *ecdsa.PrivateKey
+	timestamp int64
+}
+
+func newECDSASigner(name string, key *ecdsa.PrivateKey, timestamp int64) (note.Signer, error) {
+	pkix, err := x509.MarshalPKIXPublicKey(key.Public())
+	if err != nil {
+		return nil, err
+	}
+	h := sha256.New()
+	h.Write([]byte(name))
+	h.Write([]byte("\n"))
+	h.Write([]byte{0x03}) // Simple ECDSA key type
+	h.Write(pkix)
+	keyHash := binary.BigEndian.Uint32(h.Sum(nil))
+
+	return &ecdsaSigner{
+		name:      name,
+		keyHash:   keyHash,
+		key:       key,
+		timestamp: timestamp,
+	}, nil
+}
+
+func (s *ecdsaSigner) Name() string    { return s.name }
+func (s *ecdsaSigner) KeyHash() uint32 { return s.keyHash }
+
+func (s *ecdsaSigner) Sign(msg []byte) ([]byte, error) {
+	// Simple signature: timestamp + ECDSA signature
+	digest := sha256.Sum256(msg)
+	r, sig, err := ecdsa.Sign(rand.Reader, s.key, digest[:])
+	if err != nil {
+		return nil, err
+	}
+
+	// Encode as: timestamp (8 bytes) + r (32 bytes) + s (32 bytes)
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.BigEndian, uint64(s.timestamp))
+	buf.Write(r.Bytes())
+	buf.Write(sig.Bytes())
+
+	return buf.Bytes(), nil
+}
+
+func (s *ecdsaSigner) Verifier() note.Verifier {
+	return &ecdsaVerifier{
+		name:    s.name,
+		keyHash: s.keyHash,
+		key:     &s.key.PublicKey,
+	}
+}
+
+type ecdsaVerifier struct {
+	name    string
+	keyHash uint32
+	key     *ecdsa.PublicKey
+}
+
+func (v *ecdsaVerifier) Name() string    { return v.name }
+func (v *ecdsaVerifier) KeyHash() uint32 { return v.keyHash }
+func (v *ecdsaVerifier) Verify(msg, sig []byte) bool {
+	if len(sig) < 8 {
+		return false
+	}
+	// Skip timestamp (first 8 bytes)
+	sigData := sig[8:]
+	mid := len(sigData) / 2
+	r := new(big.Int).SetBytes(sigData[:mid])
+	s := new(big.Int).SetBytes(sigData[mid:])
+
+	digest := sha256.Sum256(msg)
+	return ecdsa.Verify(v.key, digest[:], r, s)
 }
 
 func (l *Log) hashReader(overlay map[int64]tlog.Hash) tlog.HashReaderFunc {

@@ -98,7 +98,7 @@ func (l *Log) submit(rw http.ResponseWriter, r *http.Request) {
 }
 
 func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response []byte, code int, err error) {
-	labels := prometheus.Labels{"error": "", "entity_id": "", "source": ""}
+	labels := prometheus.Labels{"error": "", "source": "", "reused": ""}
 	defer func() {
 		if err != nil {
 			labels["error"] = errorCategory(err)
@@ -130,8 +130,6 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 	if signedEntry.Timestamp == 0 {
 		return nil, http.StatusBadRequest, fmtErrorf("missing timestamp field")
 	}
-
-	labels["entity_id"] = signedEntry.EntityID
 
 	// Check timestamp for replay protection
 	if !signedEntry.IsTimestampValid() {

@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -42,6 +43,10 @@ type Log struct {
 	currentPool  *pool
 	inSequencing map[cacheHash]waitEntryFunc
 	cacheRead    *sqlite.Conn
+
+	// entityKeys maps entity IDs to their Ed25519 public keys
+	// Hardcoded for now - will be configurable later
+	entityKeys map[string]ed25519.PublicKey
 }
 
 type treeWithTimestamp struct {
@@ -240,6 +245,13 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 	m.TreeSize.Set(float64(c.N))
 	m.TreeTime.Set(float64(timestamp))
 
+	// Initialize hardcoded entity keys
+	// TODO: Make this configurable in the future
+	entityKeys := map[string]ed25519.PublicKey{
+		"witness-1": mustDecodeKey("2f8c2b3e4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1"),
+		"client-a":  mustDecodeKey("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b"),
+	}
+
 	return &Log{
 		c:              config,
 		logID:          logID,
@@ -250,7 +262,14 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 		cacheRead:      cacheRead,
 		currentPool:    newPool(),
 		cacheWrite:     cacheWrite,
+		entityKeys:     entityKeys,
 	}, nil
+}
+
+func mustDecodeKey(hexStr string) ed25519.PublicKey {
+	// TODO: In production, decode actual hex keys here
+	// For now, return a dummy 32-byte key
+	return make([]byte, 32)
 }
 
 func openCheckpoint(config *Config, b []byte) (sunlight.Checkpoint, int64, error) {

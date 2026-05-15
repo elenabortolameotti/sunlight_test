@@ -1,7 +1,9 @@
 package ctlog
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -10,11 +12,49 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"time"
 
-	"filippo.io/sunlight/internal/reused"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// SignedEntry represents a signed log entry with authentication
+type SignedEntry struct {
+	// The actual data being logged
+	Data []byte `json:"data"`
+	
+	// Entity identifier (maps to hardcoded public key)
+	EntityID string `json:"entity_id"`
+	
+	// Client-provided timestamp (Unix milliseconds) for replay protection
+	Timestamp int64 `json:"timestamp"`
+	
+	// Signature over: SHA256(data || entity_id || timestamp)
+	Signature []byte `json:"signature"`
+}
+
+// IsTimestampValid checks if the timestamp is within acceptable window
+func (e *SignedEntry) IsTimestampValid() bool {
+	// Allow ±5 minutes from current time
+	now := time.Now().UnixMilli()
+	diff := now - e.Timestamp
+	if diff < 0 {
+		diff = -diff
+	}
+	return diff <= 5*60*1000 // 5 minutes in milliseconds
+}
+
+// Verify checks if the signature is valid for this entry
+func (e *SignedEntry) Verify(pubKey ed25519.PublicKey) bool {
+	// Reconstruct the signed data: data || entity_id || timestamp
+	var buf bytes.Buffer
+	buf.Write(e.Data)
+	buf.WriteString(e.EntityID)
+	buf.WriteString(fmt.Sprintf("%d", e.Timestamp))
+	
+	signedData := sha256.Sum256(buf.Bytes())
+	return ed25519.Verify(pubKey, signedData[:], e.Signature)
+}
 
 func (l *Log) Handler() http.Handler {
 	submitLabels := prometheus.Labels{"endpoint": "submit"}
@@ -42,7 +82,7 @@ func (l *Log) submit(rw http.ResponseWriter, r *http.Request) {
 		l.c.Log.DebugContext(r.Context(), "submit error", "code", code, "err", err)
 		if code == http.StatusServiceUnavailable {
 			rw.Header().Set("Retry-After", fmt.Sprintf("%d", 30+rand.Intn(60)))
-			http.Error(rw, "this party is popular and the pool is full, please retry later", code)
+			http.Error(rw, "server busy, please retry later", code)
 			return
 		}
 		http.Error(rw, err.Error(), code)
@@ -58,50 +98,64 @@ func (l *Log) submit(rw http.ResponseWriter, r *http.Request) {
 }
 
 func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response []byte, code int, err error) {
-	labels := prometheus.Labels{"error": "", "reused": ""}
+	labels := prometheus.Labels{"error": "", "entity_id": "", "source": ""}
 	defer func() {
 		if err != nil {
 			labels["error"] = errorCategory(err)
 		}
 		l.m.AddChainCount.With(labels).Inc()
 	}()
-	if r, ok := ctx.Value(reused.ContextKey).(bool); ok {
-		labels["reused"] = fmt.Sprintf("%t", r)
-	}
 
 	body, err := io.ReadAll(reqBody)
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmtErrorf("failed to read body: %w", err)
 	}
 
-	// Accept raw data directly or JSON-wrapped data
-	var data []byte
-	if len(body) > 0 && body[0] == '{' {
-		// Try to parse as JSON
-		var req struct {
-			Data []byte `json:"data"`
-		}
-		if err := json.Unmarshal(body, &req); err == nil && len(req.Data) > 0 {
-			data = req.Data
-		} else {
-			// If JSON parsing fails or data is empty, use the raw body
-			data = body
-		}
-	} else {
-		// Raw data submission
-		data = body
+	// Parse the signed entry
+	var signedEntry SignedEntry
+	if err := json.Unmarshal(body, &signedEntry); err != nil {
+		return nil, http.StatusBadRequest, fmtErrorf("invalid JSON: %w", err)
 	}
 
-	if len(data) == 0 {
-		return nil, http.StatusBadRequest, fmtErrorf("empty data")
+	// Validate required fields
+	if len(signedEntry.Data) == 0 {
+		return nil, http.StatusBadRequest, fmtErrorf("missing data field")
+	}
+	if signedEntry.EntityID == "" {
+		return nil, http.StatusBadRequest, fmtErrorf("missing entity_id field")
+	}
+	if len(signedEntry.Signature) == 0 {
+		return nil, http.StatusBadRequest, fmtErrorf("missing signature field")
+	}
+	if signedEntry.Timestamp == 0 {
+		return nil, http.StatusBadRequest, fmtErrorf("missing timestamp field")
 	}
 
-	// Simple size check - max 16MB
-	if len(data) > 16*1024*1024 {
-		return nil, http.StatusBadRequest, fmtErrorf("data too large")
+	labels["entity_id"] = signedEntry.EntityID
+
+	// Check timestamp for replay protection
+	if !signedEntry.IsTimestampValid() {
+		return nil, http.StatusBadRequest, fmtErrorf("timestamp too old or in future (max ±5min skew)")
 	}
 
-	e := &PendingLogEntry{Data: data}
+	// Get public key for this entity
+	pubKey, exists := l.entityKeys[signedEntry.EntityID]
+	if !exists {
+		return nil, http.StatusUnauthorized, fmtErrorf("unknown entity: %s", signedEntry.EntityID)
+	}
+
+	// Verify signature
+	if !signedEntry.Verify(pubKey) {
+		return nil, http.StatusUnauthorized, fmtErrorf("invalid signature")
+	}
+
+	// Encode the signed entry for storage
+	entryBytes, err := json.Marshal(signedEntry)
+	if err != nil {
+		return nil, http.StatusInternalServerError, fmtErrorf("failed to encode entry: %w", err)
+	}
+
+	e := &PendingLogEntry{Data: entryBytes}
 
 	waitLeaf, source := l.addLeafToPool(ctx, e)
 	labels["source"] = source
@@ -121,16 +175,18 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 		return nil, http.StatusInternalServerError, fmtErrorf("failed to sequence leaf: %w", err)
 	}
 
-	// Return a simple JSON response with the leaf index and timestamp
-	hash := sha256.Sum256(data)
+	// Return response with leaf index and timestamp
+	dataHash := sha256.Sum256(signedEntry.Data)
 	rsp := struct {
 		LeafIndex int64  `json:"leaf_index"`
 		Timestamp int64  `json:"timestamp"`
 		DataHash  string `json:"data_hash"`
+		EntityID  string `json:"entity_id"`
 	}{
 		LeafIndex: seq.LeafIndex,
 		Timestamp: seq.Timestamp,
-		DataHash:  base64.StdEncoding.EncodeToString(hash[:]),
+		DataHash:  base64.StdEncoding.EncodeToString(dataHash[:]),
+		EntityID:  signedEntry.EntityID,
 	}
 	rspBytes, err := json.Marshal(rsp)
 	if err != nil {

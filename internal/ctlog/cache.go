@@ -41,26 +41,36 @@ func (l *Log) CloseCache() error {
 	return l.cacheWrite.Close()
 }
 
-func (l *Log) cacheGet(leaf *PendingLogEntry) (*sunlight.LogEntry, error) {
+func (l *Log) cacheGet(data []byte) (*sunlight.LogEntry, error) {
 	defer prometheus.NewTimer(l.m.CacheGetDuration).ObserveDuration()
-	h := computeCacheHash(leaf.Certificate, leaf.IsPrecert, leaf.IssuerKeyHash)
-	var se *sunlight.LogEntry
+	h := computeCacheHash(data)
+	var timestamp, leafIndex int64
+	var found bool
 	err := sqlitex.Exec(l.cacheRead, "SELECT timestamp, leaf_index FROM cache WHERE key = ?",
 		func(stmt *sqlite.Stmt) error {
-			se = leaf.asLogEntry(stmt.GetInt64("leaf_index"), stmt.GetInt64("timestamp"))
+			timestamp = stmt.GetInt64("timestamp")
+			leafIndex = stmt.GetInt64("leaf_index")
+			found = true
 			return nil
 		}, h[:])
 	if err != nil {
 		return nil, err
 	}
-	return se, nil
+	if !found {
+		return nil, nil
+	}
+	return &sunlight.LogEntry{
+		Data:      data,
+		Timestamp: timestamp,
+		LeafIndex: leafIndex,
+	}, nil
 }
 
 func (l *Log) cachePut(entries []*sunlight.LogEntry) (err error) {
 	defer prometheus.NewTimer(l.m.CachePutDuration).ObserveDuration()
 	defer sqlitex.Save(l.cacheWrite)(&err)
 	for _, se := range entries {
-		h := computeCacheHash(se.Certificate, se.IsPrecert, se.IssuerKeyHash)
+		h := computeCacheHash(se.Data)
 		err := sqlitex.Exec(l.cacheWrite, "INSERT INTO cache (key, timestamp, leaf_index) VALUES (?, ?, ?)",
 			nil, h[:], se.Timestamp, se.LeafIndex)
 		if err != nil {

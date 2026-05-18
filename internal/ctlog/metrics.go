@@ -189,10 +189,10 @@ func initMetrics() metrics {
 
 		AddChainCount: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
-				Name: "addchain_requests_total",
-				Help: "Number of add-[pre-]chain requests, by chain characteristics and errors if any.",
+				Name: "submit_requests_total",
+				Help: "Number of submit requests, by error and source.",
 			},
-			[]string{"error", "issuer", "root", "precert", "preissuer", "chain_len", "low_priority", "source", "reused"},
+			[]string{"error", "source", "reused"},
 		),
 		AddChainWait: prometheus.NewSummary(
 			prometheus.SummaryOpts{

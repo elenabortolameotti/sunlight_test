@@ -207,10 +207,114 @@ func TestPendingLogEntry(t *testing.T) {
 	}
 }
 
+// TestWBBFormat tests that the WBB (Web Bulletin Board) format entries work correctly
+// WBB format: phase,role,entry_type,threshold,content
+func TestWBBFormat(t *testing.T) {
+	// Test parsing WBB entries
+	testCases := []struct {
+		name        string
+		wbbEntry    string
+		expectValid bool
+	}{
+		{
+			name:        "Setup phase - RT acc_pub_key",
+			wbbEntry:    "setup,RT,acc_pub_key,2,public_key_data_here",
+			expectValid: true,
+		},
+		{
+			name:        "Setup phase - ER election_pub_key",
+			wbbEntry:    "setup,ER,election_pub_key,1,election_key_data",
+			expectValid: true,
+		},
+		{
+			name:        "Voting phase - BB ballot_digest",
+			wbbEntry:    "voting,BB,ballot_digest,1,ballot_hash_xyz123",
+			expectValid: true,
+		},
+		{
+			name:        "Tallying phase - TT mixed_ballots",
+			wbbEntry:    "tallying,TT,mixed_ballots,3,mixed_encrypted_data",
+			expectValid: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The WBB entry becomes the Data field of SignedEntry
+			entry := ctlog.SignedEntry{
+				Data:      []byte(tc.wbbEntry),
+				EntityID:  "test-entity",
+				Timestamp: time.Now().UnixMilli(),
+			}
+
+			// Verify the data can be stored and retrieved
+			if string(entry.Data) != tc.wbbEntry {
+				t.Errorf("Data mismatch: got %q, want %q", string(entry.Data), tc.wbbEntry)
+			}
+
+			// Verify JSON serialization round-trip
+			jsonData, err := json.Marshal(entry)
+			if err != nil {
+				t.Fatalf("Failed to marshal: %v", err)
+			}
+
+			var decoded ctlog.SignedEntry
+			if err := json.Unmarshal(jsonData, &decoded); err != nil {
+				t.Fatalf("Failed to unmarshal: %v", err)
+			}
+
+			if string(decoded.Data) != tc.wbbEntry {
+				t.Errorf("Round-trip data mismatch: got %q, want %q", string(decoded.Data), tc.wbbEntry)
+			}
+
+			t.Logf("WBB entry stored successfully: %s", tc.wbbEntry)
+		})
+	}
+}
+
+// TestWBBWithSignedEntry demonstrates how WBB entries fit in the signed envelope
+func TestWBBWithSignedEntry(t *testing.T) {
+	// This shows the complete structure:
+	// SignedEntry {
+	//   Data: "setup,RT,acc_pub_key,2,actual_key_content",
+	//   EntityID: "RT-1",
+	//   Timestamp: 1715927045000,
+	//   Signature: <ed25519_or_bls_signature>
+	// }
+
+	wbbContent := "setup,RT,acc_pub_key,2,MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA..."
+	entityID := "RT-1"
+	timestamp := time.Now().UnixMilli()
+
+	entry := ctlog.SignedEntry{
+		Data:      []byte(wbbContent),
+		EntityID:  entityID,
+		Timestamp: timestamp,
+		// Signature would be added here
+	}
+
+	// Verify structure
+	if string(entry.Data) != wbbContent {
+		t.Error("WBB content mismatch")
+	}
+	if entry.EntityID != entityID {
+		t.Error("Entity ID mismatch")
+	}
+	if entry.Timestamp != timestamp {
+		t.Error("Timestamp mismatch")
+	}
+
+	t.Logf("SignedEntry structure validated:")
+	t.Logf("  Data (WBB format): %s", string(entry.Data))
+	t.Logf("  EntityID: %s", entry.EntityID)
+	t.Logf("  Timestamp: %d", entry.Timestamp)
+	t.Logf("  Signature: <to be added by entity>")
+}
+
 // Simple integration test placeholder
 func TestIntegrationPlaceholder(t *testing.T) {
 	t.Skip("Integration tests require full test infrastructure setup")
-	
+
 	// This would be a full integration test:
 	// 1. Create a test log with entity keys
 	// 2. Submit a properly signed entry

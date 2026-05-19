@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -22,15 +23,18 @@ import (
 type SignedEntry struct {
 	// The actual data being logged
 	Data []byte `json:"data"`
-	
+
 	// Entity identifier (maps to hardcoded public key)
 	EntityID string `json:"entity_id"`
-	
+
 	// Client-provided timestamp (Unix milliseconds) for replay protection
 	Timestamp int64 `json:"timestamp"`
-	
+
 	// Signature over: SHA256(data || entity_id || timestamp)
 	Signature []byte `json:"signature"`
+
+	EntityIDs          []string `json:"entity_ids,omitempty"`
+	AggregateSignature []byte   `json:"aggregate_signature,omitempty"`
 }
 
 // IsTimestampValid checks if the timestamp is within acceptable window
@@ -51,7 +55,7 @@ func (e *SignedEntry) Verify(pubKey ed25519.PublicKey) bool {
 	buf.Write(e.Data)
 	buf.WriteString(e.EntityID)
 	buf.WriteString(fmt.Sprintf("%d", e.Timestamp))
-	
+
 	signedData := sha256.Sum256(buf.Bytes())
 	return ed25519.Verify(pubKey, signedData[:], e.Signature)
 }
@@ -147,6 +151,40 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 		return nil, http.StatusUnauthorized, fmtErrorf("invalid signature")
 	}
 
+	// Parse and enforce WBB write policy.
+	wbbEntry, err := ParseWBBEntry(string(signedEntry.Data))
+	if err != nil {
+		return nil, http.StatusBadRequest, fmtErrorf("invalid WBB format: %w", err)
+	}
+
+	entityRole, err := roleFromEntityID(signedEntry.EntityID)
+	if err != nil {
+		return nil, http.StatusBadRequest, fmtErrorf("invalid entity ID: %w", err)
+	}
+
+	if entityRole != wbbEntry.Role {
+		return nil, http.StatusForbidden, fmtErrorf(
+			"entity %s cannot write as role %s",
+			signedEntry.EntityID,
+			wbbEntry.Role,
+		)
+	}
+
+	allowed, err := CheckWBBWritePolicy(string(signedEntry.Data))
+	if err != nil {
+		return nil, http.StatusForbidden, fmtErrorf("write not authorized: %w", err)
+	}
+	if !allowed {
+		return nil, http.StatusForbidden, fmtErrorf("write not authorized")
+	}
+
+	if wbbEntry.Threshold > 1 {
+		return nil, http.StatusForbidden, fmtErrorf(
+			"insufficient signatures: got 1, need %d",
+			wbbEntry.Threshold,
+		)
+	}
+
 	// Encode the signed entry for storage
 	entryBytes, err := json.Marshal(signedEntry)
 	if err != nil {
@@ -193,4 +231,19 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 	}
 
 	return rspBytes, http.StatusOK, nil
+}
+
+func roleFromEntityID(entityID string) (Role, error) {
+	parts := strings.Split(entityID, "-")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", fmt.Errorf("expected ROLE-ID format, got %q", entityID)
+	}
+
+	role := Role(parts[0])
+	switch role {
+	case RoleRT, RoleER, RoleBB, RoleTT:
+		return role, nil
+	default:
+		return "", fmt.Errorf("unknown role %q", parts[0])
+	}
 }

@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,28 +32,28 @@ func TestE2ESignedEntrySubmission(t *testing.T) {
 		t.Fatalf("Failed to generate witness key: %v", err)
 	}
 	clientPub, _, _ := ed25519.GenerateKey(nil) // We don't need client-a private key for these tests
-	
+
 	// Generate log signing key (ECDSA)
 	logKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("Failed to generate log key: %v", err)
 	}
-	
+
 	// Create test log with entity keys
 	tmpDir := t.TempDir()
 	config := &ctlog.Config{
-		Name:        "test.log.example.com",
-		Key:         logKey,
-		Cache:       filepath.Join(tmpDir, "cache.db"),
-		Backend:     NewMemoryBackend(t),
-		Lock:        NewMemoryLockBackend(t),
-		Log:         slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
-		EntityKeys:  map[string]ed25519.PublicKey{
+		Name:    "test.log.example.com",
+		Key:     logKey,
+		Cache:   filepath.Join(tmpDir, "cache.db"),
+		Backend: NewMemoryBackend(t),
+		Lock:    NewMemoryLockBackend(t),
+		Log:     slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		EntityKeys: map[string]ed25519.PublicKey{
 			"witness-1": witnessPub,
 			"client-a":  clientPub,
 		},
 	}
-	
+
 	// Create the log
 	ctx := context.Background()
 	if err := ctlog.CreateLog(ctx, config); err != nil {
@@ -64,7 +65,7 @@ func TestE2ESignedEntrySubmission(t *testing.T) {
 		t.Fatalf("Failed to load log: %v", err)
 	}
 	defer log.CloseCache()
-	
+
 	// Create HTTP handler using the log's handler
 	server := httptest.NewServer(log.Handler())
 	defer server.Close()
@@ -85,15 +86,15 @@ func TestE2ESignedEntrySubmission(t *testing.T) {
 			}
 		}
 	}()
-	
+
 	// Test 1: Submit valid signed entry
 	t.Run("valid signed entry", func(t *testing.T) {
 		data := []byte("hello world")
 		entityID := "witness-1"
 		timestamp := time.Now().UnixMilli()
-		
+
 		signedEntry := createSignedEntry(t, data, entityID, timestamp, witnessPriv)
-		
+
 		resp := submitEntry(t, server.URL+"/submit", signedEntry)
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
@@ -101,7 +102,7 @@ func TestE2ESignedEntrySubmission(t *testing.T) {
 		}
 		resp.Body.Close()
 	})
-	
+
 	// Test 2: Submit unsigned entry (should fail)
 	t.Run("unsigned entry rejected", func(t *testing.T) {
 		unsignedEntry := ctlog.SignedEntry{
@@ -110,7 +111,7 @@ func TestE2ESignedEntrySubmission(t *testing.T) {
 			Timestamp: time.Now().UnixMilli(),
 			// No signature
 		}
-		
+
 		resp := submitEntry(t, server.URL+"/submit", unsignedEntry)
 		// Missing signature returns 400 (bad request), not 401 (unauthorized)
 		if resp.StatusCode != http.StatusBadRequest {
@@ -118,48 +119,48 @@ func TestE2ESignedEntrySubmission(t *testing.T) {
 		}
 		resp.Body.Close()
 	})
-	
+
 	// Test 3: Submit with invalid signature (should fail)
 	t.Run("invalid signature rejected", func(t *testing.T) {
 		data := []byte("tampered data")
 		entityID := "witness-1"
 		timestamp := time.Now().UnixMilli()
-		
+
 		// Create entry but with wrong signature
 		signedEntry := createSignedEntry(t, data, entityID, timestamp, witnessPriv)
 		signedEntry.Signature = append(signedEntry.Signature[:len(signedEntry.Signature)-1], byte(0xFF)) // Corrupt signature
-		
+
 		resp := submitEntry(t, server.URL+"/submit", signedEntry)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Errorf("Expected 401 for invalid signature, got %d", resp.StatusCode)
 		}
 		resp.Body.Close()
 	})
-	
+
 	// Test 4: Submit with unknown entity (should fail)
 	t.Run("unknown entity rejected", func(t *testing.T) {
 		data := []byte("unknown entity data")
 		entityID := "unknown-entity"
 		timestamp := time.Now().UnixMilli()
-		
+
 		_, unknownPriv, _ := ed25519.GenerateKey(nil)
 		signedEntry := createSignedEntry(t, data, entityID, timestamp, unknownPriv)
-		
+
 		resp := submitEntry(t, server.URL+"/submit", signedEntry)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Errorf("Expected 401 for unknown entity, got %d", resp.StatusCode)
 		}
 		resp.Body.Close()
 	})
-	
+
 	// Test 5: Submit with old timestamp (should fail)
 	t.Run("old timestamp rejected", func(t *testing.T) {
 		data := []byte("old timestamp data")
 		entityID := "witness-1"
 		timestamp := time.Now().Add(-10 * time.Minute).UnixMilli() // 10 minutes ago
-		
+
 		signedEntry := createSignedEntry(t, data, entityID, timestamp, witnessPriv)
-		
+
 		resp := submitEntry(t, server.URL+"/submit", signedEntry)
 		// Invalid timestamp returns 400 (bad request)
 		if resp.StatusCode != http.StatusBadRequest {
@@ -167,15 +168,15 @@ func TestE2ESignedEntrySubmission(t *testing.T) {
 		}
 		resp.Body.Close()
 	})
-	
+
 	// Test 6: Submit with future timestamp (should fail)
 	t.Run("future timestamp rejected", func(t *testing.T) {
 		data := []byte("future timestamp data")
 		entityID := "witness-1"
 		timestamp := time.Now().Add(10 * time.Minute).UnixMilli() // 10 minutes in future
-		
+
 		signedEntry := createSignedEntry(t, data, entityID, timestamp, witnessPriv)
-		
+
 		resp := submitEntry(t, server.URL+"/submit", signedEntry)
 		// Invalid timestamp returns 400 (bad request)
 		if resp.StatusCode != http.StatusBadRequest {
@@ -193,9 +194,9 @@ func createSignedEntry(t *testing.T, data []byte, entityID string, timestamp int
 	buf.WriteString(entityID)
 	buf.WriteString(fmt.Sprintf("%d", timestamp))
 	signingData := sha256.Sum256(buf.Bytes())
-	
+
 	signature := ed25519.Sign(privateKey, signingData[:])
-	
+
 	return ctlog.SignedEntry{
 		Data:      data,
 		EntityID:  entityID,
@@ -210,21 +211,21 @@ func submitEntry(t *testing.T, url string, entry ctlog.SignedEntry) *http.Respon
 	if err != nil {
 		t.Fatalf("Failed to marshal entry: %v", err)
 	}
-	
+
 	resp, err := http.Post(url, "application/json", bytes.NewReader(jsonData))
 	if err != nil {
 		t.Fatalf("Failed to submit entry: %v", err)
 	}
-	
+
 	return resp
 }
 
 // Test helpers (recreated from removed testlog_test.go)
 
 type MemoryBackend struct {
-	t   testing.TB
-	mu  bytes.Buffer // Placeholder for mutex
-	m   map[string][]byte
+	t  testing.TB
+	mu sync.Mutex // Placeholder for mutex
+	m  map[string][]byte
 }
 
 func NewMemoryBackend(t testing.TB) *MemoryBackend {
@@ -235,11 +236,15 @@ func NewMemoryBackend(t testing.TB) *MemoryBackend {
 }
 
 func (b *MemoryBackend) Upload(ctx context.Context, key string, data []byte, opts *ctlog.UploadOptions) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.m[key] = data
 	return nil
 }
 
 func (b *MemoryBackend) Fetch(ctx context.Context, key string) ([]byte, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	data, ok := b.m[key]
 	if !ok {
 		return nil, fmt.Errorf("key %q not found", key)
@@ -248,6 +253,8 @@ func (b *MemoryBackend) Fetch(ctx context.Context, key string) ([]byte, error) {
 }
 
 func (b *MemoryBackend) Discard(ctx context.Context, key string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	delete(b.m, key)
 	return nil
 }
@@ -255,7 +262,8 @@ func (b *MemoryBackend) Discard(ctx context.Context, key string) error {
 func (b *MemoryBackend) Metrics() []prometheus.Collector { return nil }
 
 type MemoryLockBackend struct {
-	t testing.TB
+	t  testing.TB
+	mu sync.Mutex
 	m  map[[sha256.Size]byte][]byte
 }
 
@@ -267,6 +275,8 @@ func NewMemoryLockBackend(t testing.TB) *MemoryLockBackend {
 }
 
 func (b *MemoryLockBackend) Fetch(ctx context.Context, logID [sha256.Size]byte) (ctlog.LockedCheckpoint, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	data, ok := b.m[logID]
 	if !ok {
 		return nil, fmt.Errorf("log %x not found", logID)
@@ -275,6 +285,8 @@ func (b *MemoryLockBackend) Fetch(ctx context.Context, logID [sha256.Size]byte) 
 }
 
 func (b *MemoryLockBackend) Create(ctx context.Context, logID [sha256.Size]byte, new []byte) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if _, ok := b.m[logID]; ok {
 		return fmt.Errorf("log %x already exists", logID)
 	}
@@ -283,6 +295,8 @@ func (b *MemoryLockBackend) Create(ctx context.Context, logID [sha256.Size]byte,
 }
 
 func (b *MemoryLockBackend) Replace(ctx context.Context, old ctlog.LockedCheckpoint, new []byte) (ctlog.LockedCheckpoint, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if old == nil {
 		return nil, fmt.Errorf("old checkpoint is nil")
 	}

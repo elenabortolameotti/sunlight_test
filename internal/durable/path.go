@@ -54,7 +54,7 @@ func WriteFile(name string, data []byte, perm os.FileMode) (err error) {
 	//
 	// Keep the parent open during the operation, to prevent it from being
 	// evicted from the inode cache, which can discard a write-through error.
-	parent, err := os.OpenFile(filepath.Dir(name), os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	parent, err := os.OpenFile(filepath.Dir(name), os.O_RDONLY|0, 0)
 	if err != nil {
 		return &os.PathError{Op: "durablewrite", Path: name, Err: err}
 	}
@@ -121,7 +121,7 @@ func MkdirAll(path string, perm os.FileMode) (err error) {
 // to disk. Unlike [os.Mkdir], it returns nil if the directory already exists to
 // prevent returning errors in case of races.
 func Mkdir(path string, perm os.FileMode) (err error) {
-	parent, err := os.OpenFile(filepath.Dir(path), os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	parent, err := os.OpenFile(filepath.Dir(path), os.O_RDONLY|0, 0)
 	if err != nil {
 		return &os.PathError{Op: "mkdir", Path: path, Err: err}
 	}
@@ -131,7 +131,7 @@ func Mkdir(path string, perm os.FileMode) (err error) {
 		return err
 	}
 
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	f, err := os.OpenFile(path, os.O_RDONLY|0, 0)
 	if err != nil {
 		return &os.PathError{Op: "mkdir", Path: path, Err: err}
 	}

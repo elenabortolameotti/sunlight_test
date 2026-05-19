@@ -1,11 +1,13 @@
 package ctlog_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"log/slog"
@@ -24,25 +26,25 @@ import (
 func TestWBBPolicyAllEntities(t *testing.T) {
 	// Generate keys for all entity types
 	entityKeys := generateTestEntityKeys(t)
-	
+
 	// Generate log signing key (ECDSA)
 	logKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("Failed to generate log key: %v", err)
 	}
-	
+
 	// Create test log with all entity keys
 	tmpDir := t.TempDir()
 	config := &ctlog.Config{
-		Name:        "test.wbb.example.com",
-		Key:         logKey,
-		Cache:       filepath.Join(tmpDir, "cache.db"),
-		Backend:     NewMemoryBackend(t),
-		Lock:        NewMemoryLockBackend(t),
-		Log:         slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
-		EntityKeys:  entityKeys,
+		Name:       "test.wbb.example.com",
+		Key:        logKey,
+		Cache:      filepath.Join(tmpDir, "cache.db"),
+		Backend:    NewMemoryBackend(t),
+		Lock:       NewMemoryLockBackend(t),
+		Log:        slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		EntityKeys: entityKeys,
 	}
-	
+
 	// Create and load the log
 	ctx := context.Background()
 	if err := ctlog.CreateLog(ctx, config); err != nil {
@@ -54,7 +56,7 @@ func TestWBBPolicyAllEntities(t *testing.T) {
 		t.Fatalf("Failed to load log: %v", err)
 	}
 	defer log.CloseCache()
-	
+
 	// Create HTTP handler
 	server := httptest.NewServer(log.Handler())
 	defer server.Close()
@@ -111,10 +113,10 @@ func testSetupPhaseRT(t *testing.T, serverURL string, keys map[string]ed25519.Pu
 	t.Run("RT can write acc_pub_key with threshold 2", func(t *testing.T) {
 		// WBB format: phase,role,entry_type,threshold,content
 		wbbData := "setup,RT,acc_pub_key,2,test_acc_public_key_data"
-		
+
 		// Create signed entry from RT-1
 		entry := createWBBEntry(t, wbbData, "RT-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		// Initially this should pass authentication but may fail policy check
 		// Once policy is implemented, this should check threshold
@@ -126,7 +128,7 @@ func testSetupPhaseRT(t *testing.T, serverURL string, keys map[string]ed25519.Pu
 	t.Run("RT cannot write other entry types", func(t *testing.T) {
 		wbbData := "setup,RT,election_pub_key,2,invalid_rt_writing_er_data"
 		entry := createWBBEntry(t, wbbData, "RT-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		// Should be rejected - RT can only write acc_pub_key
 		if resp.StatusCode == http.StatusOK {
@@ -140,7 +142,7 @@ func testSetupPhaseER(t *testing.T, serverURL string, keys map[string]ed25519.Pu
 	t.Run("ER can write election_pub_key", func(t *testing.T) {
 		wbbData := "setup,ER,election_pub_key,1,election_public_key_xyz"
 		entry := createWBBEntry(t, wbbData, "ER-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("ER election_pub_key submission response: %d - %s", resp.StatusCode, string(body))
@@ -150,7 +152,7 @@ func testSetupPhaseER(t *testing.T, serverURL string, keys map[string]ed25519.Pu
 	t.Run("ER can write pseudonymous_id_count", func(t *testing.T) {
 		wbbData := "setup,ER,pseudonymous_id_count,1,1000"
 		entry := createWBBEntry(t, wbbData, "ER-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("ER pseudonymous_id_count submission response: %d - %s", resp.StatusCode, string(body))
@@ -160,7 +162,7 @@ func testSetupPhaseER(t *testing.T, serverURL string, keys map[string]ed25519.Pu
 	t.Run("ER can write voter_id_merkle_root", func(t *testing.T) {
 		wbbData := "setup,ER,voter_id_merkle_root,1,merkle_root_hash_abc123"
 		entry := createWBBEntry(t, wbbData, "ER-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("ER voter_id_merkle_root submission response: %d - %s", resp.StatusCode, string(body))
@@ -170,7 +172,7 @@ func testSetupPhaseER(t *testing.T, serverURL string, keys map[string]ed25519.Pu
 	t.Run("ER cannot write RT entry types", func(t *testing.T) {
 		wbbData := "setup,ER,acc_pub_key,1,invalid_er_writing_rt_data"
 		entry := createWBBEntry(t, wbbData, "ER-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		if resp.StatusCode == http.StatusOK {
 			t.Error("Expected policy violation for ER writing acc_pub_key")
@@ -185,7 +187,7 @@ func testVotingPhaseBB(t *testing.T, serverURL string, keys map[string]ed25519.P
 	t.Run("BB can write ballot_digest", func(t *testing.T) {
 		wbbData := "voting,BB,ballot_digest,1,ballot_hash_xyz789"
 		entry := createWBBEntry(t, wbbData, "BB-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("BB ballot_digest submission response: %d - %s", resp.StatusCode, string(body))
@@ -195,7 +197,7 @@ func testVotingPhaseBB(t *testing.T, serverURL string, keys map[string]ed25519.P
 	t.Run("BB can write ballot_metadata", func(t *testing.T) {
 		wbbData := "voting,BB,ballot_metadata,1,metadata_json_content"
 		entry := createWBBEntry(t, wbbData, "BB-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("BB ballot_metadata submission response: %d - %s", resp.StatusCode, string(body))
@@ -205,7 +207,7 @@ func testVotingPhaseBB(t *testing.T, serverURL string, keys map[string]ed25519.P
 	t.Run("BB can write cast_intended_proof", func(t *testing.T) {
 		wbbData := "voting,BB,cast_intended_proof,1,proof_data_here"
 		entry := createWBBEntry(t, wbbData, "BB-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("BB cast_intended_proof submission response: %d - %s", resp.StatusCode, string(body))
@@ -219,7 +221,7 @@ func testTallyingPhaseBB(t *testing.T, serverURL string, keys map[string]ed25519
 	t.Run("BB can write encrypted_ballot", func(t *testing.T) {
 		wbbData := "tallying,BB,encrypted_ballot,1,encrypted_ballot_data"
 		entry := createWBBEntry(t, wbbData, "BB-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("BB encrypted_ballot submission response: %d - %s", resp.StatusCode, string(body))
@@ -231,7 +233,7 @@ func testTallyingPhaseTT(t *testing.T, serverURL string, keys map[string]ed25519
 	t.Run("TT can write mixed_ballots with threshold 3", func(t *testing.T) {
 		wbbData := "tallying,TT,mixed_ballots,3,mixed_shuffled_ballots"
 		entry := createWBBEntry(t, wbbData, "TT-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("TT mixed_ballots submission response: %d - %s", resp.StatusCode, string(body))
@@ -241,7 +243,7 @@ func testTallyingPhaseTT(t *testing.T, serverURL string, keys map[string]ed25519
 	t.Run("TT can write re_encryption_proof", func(t *testing.T) {
 		wbbData := "tallying,TT,re_encryption_proof,3,proof_of_re_encryption"
 		entry := createWBBEntry(t, wbbData, "TT-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("TT re_encryption_proof submission response: %d - %s", resp.StatusCode, string(body))
@@ -251,7 +253,7 @@ func testTallyingPhaseTT(t *testing.T, serverURL string, keys map[string]ed25519
 	t.Run("TT can write tally_result", func(t *testing.T) {
 		wbbData := "tallying,TT,tally_result,3,final_election_results"
 		entry := createWBBEntry(t, wbbData, "TT-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("TT tally_result submission response: %d - %s", resp.StatusCode, string(body))
@@ -261,7 +263,7 @@ func testTallyingPhaseTT(t *testing.T, serverURL string, keys map[string]ed25519
 	t.Run("TT can write tally_proof", func(t *testing.T) {
 		wbbData := "tallying,TT,tally_proof,3,proof_of_correct_tally"
 		entry := createWBBEntry(t, wbbData, "TT-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("TT tally_proof submission response: %d - %s", resp.StatusCode, string(body))
@@ -275,7 +277,7 @@ func testPolicyViolations(t *testing.T, serverURL string, keys map[string]ed2551
 	t.Run("BB cannot write setup phase entries", func(t *testing.T) {
 		wbbData := "setup,BB,acc_pub_key,1,invalid_bb_in_setup"
 		entry := createWBBEntry(t, wbbData, "BB-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		if resp.StatusCode == http.StatusOK {
 			t.Error("Expected policy violation: BB cannot write in setup phase")
@@ -286,7 +288,7 @@ func testPolicyViolations(t *testing.T, serverURL string, keys map[string]ed2551
 	t.Run("RT cannot write in voting phase", func(t *testing.T) {
 		wbbData := "voting,RT,ballot_digest,1,invalid_rt_in_voting"
 		entry := createWBBEntry(t, wbbData, "RT-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		if resp.StatusCode == http.StatusOK {
 			t.Error("Expected policy violation: RT cannot write in voting phase")
@@ -297,7 +299,7 @@ func testPolicyViolations(t *testing.T, serverURL string, keys map[string]ed2551
 	t.Run("ER cannot write in tallying phase", func(t *testing.T) {
 		wbbData := "tallying,ER,tally_result,1,invalid_er_in_tallying"
 		entry := createWBBEntry(t, wbbData, "ER-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		if resp.StatusCode == http.StatusOK {
 			t.Error("Expected policy violation: ER cannot write in tallying phase")
@@ -308,7 +310,7 @@ func testPolicyViolations(t *testing.T, serverURL string, keys map[string]ed2551
 	t.Run("TT cannot write in setup phase", func(t *testing.T) {
 		wbbData := "setup,TT,election_pub_key,3,invalid_tt_in_setup"
 		entry := createWBBEntry(t, wbbData, "TT-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		if resp.StatusCode == http.StatusOK {
 			t.Error("Expected policy violation: TT cannot write in setup phase")
@@ -324,7 +326,7 @@ func testThresholdEnforcement(t *testing.T, serverURL string, keys map[string]ed
 		// Single RT submission with threshold=1 should fail
 		wbbData := "setup,RT,acc_pub_key,1,acc_key_with_insufficient_threshold"
 		entry := createWBBEntry(t, wbbData, "RT-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		// Should be rejected - threshold 1 < required 2
 		if resp.StatusCode == http.StatusOK {
@@ -337,7 +339,7 @@ func testThresholdEnforcement(t *testing.T, serverURL string, keys map[string]ed
 		// Single TT submission with threshold=1 should fail
 		wbbData := "tallying,TT,mixed_ballots,1,mixed_with_insufficient_threshold"
 		entry := createWBBEntry(t, wbbData, "TT-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		// Should be rejected - threshold 1 < required 3
 		if resp.StatusCode == http.StatusOK {
@@ -350,7 +352,7 @@ func testThresholdEnforcement(t *testing.T, serverURL string, keys map[string]ed
 		// ER only needs threshold 1
 		wbbData := "setup,ER,election_pub_key,1,election_key_threshold_1"
 		entry := createWBBEntry(t, wbbData, "ER-1", keys)
-		
+
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		// This should pass - ER only needs threshold 1
 		body, _ := io.ReadAll(resp.Body)
@@ -362,60 +364,70 @@ func testThresholdEnforcement(t *testing.T, serverURL string, keys map[string]ed
 // ============ HELPER FUNCTIONS ============
 
 // generateTestEntityKeys creates keys for all entity types used in WBB
+var testEntityPrivateKeys map[string]ed25519.PrivateKey
+
 func generateTestEntityKeys(t *testing.T) map[string]ed25519.PublicKey {
 	keys := make(map[string]ed25519.PublicKey)
-	
+
+	testEntityPrivateKeys = make(map[string]ed25519.PrivateKey)
+
+	addEntity := func(entityID string) {
+		pub, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("failed to generate key for %s: %v", entityID, err)
+		}
+
+		keys[entityID] = pub
+		testEntityPrivateKeys[entityID] = priv
+	}
 	// RT entities (need at least 2)
 	for i := 1; i <= 3; i++ {
-		pub, _, err := ed25519.GenerateKey(nil)
-		if err != nil {
-			t.Fatalf("Failed to generate RT-%d key: %v", i, err)
-		}
-		keys[fmt.Sprintf("RT-%d", i)] = pub
+		addEntity(fmt.Sprintf("RT-%d", i))
 	}
-	
+
 	// ER entities (need at least 1)
 	for i := 1; i <= 2; i++ {
-		pub, _, err := ed25519.GenerateKey(nil)
-		if err != nil {
-			t.Fatalf("Failed to generate ER-%d key: %v", i, err)
-		}
-		keys[fmt.Sprintf("ER-%d", i)] = pub
+		addEntity(fmt.Sprintf("ER-%d", i))
 	}
-	
+
 	// BB entities (need at least 1)
 	for i := 1; i <= 2; i++ {
-		pub, _, err := ed25519.GenerateKey(nil)
-		if err != nil {
-			t.Fatalf("Failed to generate BB-%d key: %v", i, err)
-		}
-		keys[fmt.Sprintf("BB-%d", i)] = pub
+		addEntity(fmt.Sprintf("BB-%d", i))
 	}
-	
+
 	// TT entities (need at least 3)
 	for i := 1; i <= 5; i++ {
-		pub, _, err := ed25519.GenerateKey(nil)
-		if err != nil {
-			t.Fatalf("Failed to generate TT-%d key: %v", i, err)
-		}
-		keys[fmt.Sprintf("TT-%d", i)] = pub
+		addEntity(fmt.Sprintf("TT-%d", i))
 	}
-	
+
 	return keys
 }
 
 // createWBBEntry creates a signed entry for WBB format data
 func createWBBEntry(t *testing.T, wbbData, entityID string, keys map[string]ed25519.PublicKey) ctlog.SignedEntry {
 	timestamp := time.Now().UnixMilli()
-	
+
+	priv, ok := testEntityPrivateKeys[entityID]
+	if !ok {
+		t.Fatalf("missing private key for entity %s", entityID)
+	}
+
 	// For now, create a placeholder signature
 	// In real implementation, this would sign with the entity's private key
-	return ctlog.SignedEntry{
+	entry := ctlog.SignedEntry{
 		Data:      []byte(wbbData),
 		EntityID:  entityID,
 		Timestamp: timestamp,
-		Signature: []byte("placeholder_signature_for_" + entityID),
 	}
+	var buf bytes.Buffer
+	buf.Write(entry.Data)
+	buf.WriteString(entry.EntityID)
+	buf.WriteString(fmt.Sprintf("%d", entry.Timestamp))
+
+	signedData := sha256.Sum256(buf.Bytes())
+	entry.Signature = ed25519.Sign(priv, signedData[:])
+
+	return entry
 }
 
 // submitEntry submits a signed entry to the server

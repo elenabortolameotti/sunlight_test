@@ -52,6 +52,9 @@ type Log struct {
 	// entityKeys maps entity IDs to their Ed25519 public keys
 	// Hardcoded for now - will be configurable later
 	entityKeys map[string]ed25519.PublicKey
+
+	// Added
+	entityBLSKeys map[string][]byte
 }
 
 type treeWithTimestamp struct {
@@ -81,6 +84,9 @@ type Config struct {
 	Lock       LockBackend
 	Log        *slog.Logger
 	EntityKeys map[string]ed25519.PublicKey // Optional: override hardcoded entity keys
+
+	// Added
+	EntityBLSKeys map[string][]byte
 }
 
 var ErrLogExists = errors.New("checkpoint already exist, refusing to initialize log")
@@ -262,6 +268,16 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 		}
 	}
 
+	// Initialize BLS entity keys for aggregate signatures.
+	// These are public keys only: the server verifies aggregate signatures,
+	// it does not sign on behalf of RT/TT entities.
+	var entityBLSKeys map[string][]byte
+	if config.EntityBLSKeys != nil {
+		entityBLSKeys = config.EntityBLSKeys
+	} else {
+		entityBLSKeys = map[string][]byte{}
+	}
+
 	return &Log{
 		c:              config,
 		logID:          logID,
@@ -273,6 +289,7 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 		currentPool:    newPool(),
 		cacheWrite:     cacheWrite,
 		entityKeys:     entityKeys,
+		entityBLSKeys:  entityBLSKeys,
 	}, nil
 }
 

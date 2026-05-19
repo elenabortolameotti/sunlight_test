@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"filippo.io/sunlight/internal/my_crypto"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -25,13 +26,13 @@ type SignedEntry struct {
 	Data []byte `json:"data"`
 
 	// Entity identifier (maps to hardcoded public key)
-	EntityID string `json:"entity_id"`
+	EntityID string `json:"entity_id,omitempty"`
 
 	// Client-provided timestamp (Unix milliseconds) for replay protection
 	Timestamp int64 `json:"timestamp"`
 
 	// Signature over: SHA256(data || entity_id || timestamp)
-	Signature []byte `json:"signature"`
+	Signature []byte `json:"signature,omitempty"`
 
 	EntityIDs          []string `json:"entity_ids,omitempty"`
 	AggregateSignature []byte   `json:"aggregate_signature,omitempty"`
@@ -101,6 +102,132 @@ func (l *Log) submit(rw http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// What the log does:
+// pretendo data e timestamp
+//parso la WBB entry
+//controllo la policy
+//se threshold == 1:
+//   pretendo entity_id + signature
+//   verifico Ed25519
+//se threshold > 1:
+//   pretendo entity_ids + aggregate_signature
+//   verifico BLS aggregata
+
+func (l *Log) verifySingleWBBEntry(signedEntry SignedEntry, wbbEntry WBBEntry) error {
+	if signedEntry.EntityID == "" {
+		return fmtErrorf("missing entity_id field")
+	}
+	if len(signedEntry.Signature) == 0 {
+		return fmtErrorf("missing signature field")
+	}
+
+	entityRole, err := roleFromEntityID(signedEntry.EntityID)
+	if err != nil {
+		return fmtErrorf("invalid entity ID: %w", err)
+	}
+
+	if entityRole != wbbEntry.Role {
+		return fmtErrorf(
+			"entity %s cannot write as role %s",
+			signedEntry.EntityID,
+			wbbEntry.Role,
+		)
+	}
+
+	pubKey, exists := l.entityKeys[signedEntry.EntityID]
+	if !exists {
+		return fmtErrorf("unknown entity: %s", signedEntry.EntityID)
+	}
+
+	if !signedEntry.Verify(pubKey) {
+		return fmtErrorf("invalid signature")
+	}
+
+	return nil
+}
+
+func aggregateSignedMessage(data []byte, timestamp int64, entityIDs []string) []byte {
+	var buf bytes.Buffer
+	buf.Write(data)
+	buf.WriteString(fmt.Sprintf("%d", timestamp))
+
+	for _, entityID := range entityIDs {
+		buf.WriteString("|")
+		buf.WriteString(entityID)
+	}
+
+	h := sha256.Sum256(buf.Bytes())
+	return h[:]
+}
+
+func (l *Log) verifyAggregateWBBEntry(signedEntry SignedEntry, wbbEntry WBBEntry) error {
+	if len(signedEntry.EntityIDs) == 0 {
+		return fmtErrorf("missing entity_ids field")
+	}
+
+	if len(signedEntry.AggregateSignature) == 0 {
+		return fmtErrorf("missing aggregate_signature field")
+	}
+
+	if len(signedEntry.EntityIDs) < wbbEntry.Threshold {
+		return fmtErrorf(
+			"insufficient signatures: got %d, need %d",
+			len(signedEntry.EntityIDs),
+			wbbEntry.Threshold,
+		)
+	}
+
+	seen := make(map[string]bool)
+	pubKeys := make([][]byte, 0, len(signedEntry.EntityIDs))
+
+	for _, entityID := range signedEntry.EntityIDs {
+		if seen[entityID] {
+			return fmtErrorf("duplicate signer: %s", entityID)
+		}
+		seen[entityID] = true
+
+		entityRole, err := roleFromEntityID(entityID)
+		if err != nil {
+			return fmtErrorf("invalid entity ID %s: %w", entityID, err)
+		}
+
+		if entityRole != wbbEntry.Role {
+			return fmtErrorf(
+				"entity %s cannot write as role %s",
+				entityID,
+				wbbEntry.Role,
+			)
+		}
+
+		pubKey, exists := l.entityBLSKeys[entityID]
+		if !exists {
+			return fmtErrorf("unknown BLS entity: %s", entityID)
+		}
+
+		pubKeys = append(pubKeys, pubKey)
+	}
+
+	msg := aggregateSignedMessage(
+		signedEntry.Data,
+		signedEntry.Timestamp,
+		signedEntry.EntityIDs,
+	)
+
+	ok, err := my_crypto.VerifyAggregateBytes(
+		pubKeys,
+		msg,
+		signedEntry.AggregateSignature,
+	)
+	if err != nil {
+		return fmtErrorf("invalid aggregate signature: %w", err)
+	}
+	if !ok {
+		return fmtErrorf("invalid aggregate signature")
+	}
+
+	return nil
+}
+
 func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response []byte, code int, err error) {
 	labels := prometheus.Labels{"error": "", "source": "", "reused": ""}
 	defer func() {
@@ -115,59 +242,25 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 		return nil, http.StatusInternalServerError, fmtErrorf("failed to read body: %w", err)
 	}
 
-	// Parse the signed entry
 	var signedEntry SignedEntry
 	if err := json.Unmarshal(body, &signedEntry); err != nil {
 		return nil, http.StatusBadRequest, fmtErrorf("invalid JSON: %w", err)
 	}
 
-	// Validate required fields
 	if len(signedEntry.Data) == 0 {
 		return nil, http.StatusBadRequest, fmtErrorf("missing data field")
-	}
-	if signedEntry.EntityID == "" {
-		return nil, http.StatusBadRequest, fmtErrorf("missing entity_id field")
-	}
-	if len(signedEntry.Signature) == 0 {
-		return nil, http.StatusBadRequest, fmtErrorf("missing signature field")
 	}
 	if signedEntry.Timestamp == 0 {
 		return nil, http.StatusBadRequest, fmtErrorf("missing timestamp field")
 	}
 
-	// Check timestamp for replay protection
 	if !signedEntry.IsTimestampValid() {
 		return nil, http.StatusBadRequest, fmtErrorf("timestamp too old or in future (max ±5min skew)")
 	}
 
-	// Get public key for this entity
-	pubKey, exists := l.entityKeys[signedEntry.EntityID]
-	if !exists {
-		return nil, http.StatusUnauthorized, fmtErrorf("unknown entity: %s", signedEntry.EntityID)
-	}
-
-	// Verify signature
-	if !signedEntry.Verify(pubKey) {
-		return nil, http.StatusUnauthorized, fmtErrorf("invalid signature")
-	}
-
-	// Parse and enforce WBB write policy.
 	wbbEntry, err := ParseWBBEntry(string(signedEntry.Data))
 	if err != nil {
 		return nil, http.StatusBadRequest, fmtErrorf("invalid WBB format: %w", err)
-	}
-
-	entityRole, err := roleFromEntityID(signedEntry.EntityID)
-	if err != nil {
-		return nil, http.StatusBadRequest, fmtErrorf("invalid entity ID: %w", err)
-	}
-
-	if entityRole != wbbEntry.Role {
-		return nil, http.StatusForbidden, fmtErrorf(
-			"entity %s cannot write as role %s",
-			signedEntry.EntityID,
-			wbbEntry.Role,
-		)
 	}
 
 	allowed, err := CheckWBBWritePolicy(string(signedEntry.Data))
@@ -178,14 +271,16 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 		return nil, http.StatusForbidden, fmtErrorf("write not authorized")
 	}
 
-	if wbbEntry.Threshold > 1 {
-		return nil, http.StatusForbidden, fmtErrorf(
-			"insufficient signatures: got 1, need %d",
-			wbbEntry.Threshold,
-		)
+	if wbbEntry.Threshold == 1 {
+		if err := l.verifySingleWBBEntry(signedEntry, wbbEntry); err != nil {
+			return nil, http.StatusForbidden, err
+		}
+	} else {
+		if err := l.verifyAggregateWBBEntry(signedEntry, wbbEntry); err != nil {
+			return nil, http.StatusForbidden, err
+		}
 	}
 
-	// Encode the signed entry for storage
 	entryBytes, err := json.Marshal(signedEntry)
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmtErrorf("failed to encode entry: %w", err)
@@ -211,19 +306,22 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 		return nil, http.StatusInternalServerError, fmtErrorf("failed to sequence leaf: %w", err)
 	}
 
-	// Return response with leaf index and timestamp
 	dataHash := sha256.Sum256(signedEntry.Data)
+
 	rsp := struct {
-		LeafIndex int64  `json:"leaf_index"`
-		Timestamp int64  `json:"timestamp"`
-		DataHash  string `json:"data_hash"`
-		EntityID  string `json:"entity_id"`
+		LeafIndex int64    `json:"leaf_index"`
+		Timestamp int64    `json:"timestamp"`
+		DataHash  string   `json:"data_hash"`
+		EntityID  string   `json:"entity_id,omitempty"`
+		EntityIDs []string `json:"entity_ids,omitempty"`
 	}{
 		LeafIndex: seq.LeafIndex,
 		Timestamp: seq.Timestamp,
 		DataHash:  base64.StdEncoding.EncodeToString(dataHash[:]),
 		EntityID:  signedEntry.EntityID,
+		EntityIDs: signedEntry.EntityIDs,
 	}
+
 	rspBytes, err := json.Marshal(rsp)
 	if err != nil {
 		l.c.Log.ErrorContext(ctx, "failed to encode response", "err", err)

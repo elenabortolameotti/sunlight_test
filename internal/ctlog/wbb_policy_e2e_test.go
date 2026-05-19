@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"filippo.io/sunlight/internal/ctlog"
+	"filippo.io/sunlight/internal/my_crypto"
 )
 
 // TestWBBPolicyAllEntities tests the complete WBB policy integration
@@ -36,13 +37,14 @@ func TestWBBPolicyAllEntities(t *testing.T) {
 	// Create test log with all entity keys
 	tmpDir := t.TempDir()
 	config := &ctlog.Config{
-		Name:       "test.wbb.example.com",
-		Key:        logKey,
-		Cache:      filepath.Join(tmpDir, "cache.db"),
-		Backend:    NewMemoryBackend(t),
-		Lock:       NewMemoryLockBackend(t),
-		Log:        slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
-		EntityKeys: entityKeys,
+		Name:          "test.wbb.example.com",
+		Key:           logKey,
+		Cache:         filepath.Join(tmpDir, "cache.db"),
+		Backend:       NewMemoryBackend(t),
+		Lock:          NewMemoryLockBackend(t),
+		Log:           slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		EntityKeys:    entityKeys,
+		EntityBLSKeys: testEntityBLSKeys,
 	}
 
 	// Create and load the log
@@ -115,14 +117,16 @@ func testSetupPhaseRT(t *testing.T, serverURL string, keys map[string]ed25519.Pu
 		wbbData := "setup,RT,acc_pub_key,2,test_acc_public_key_data"
 
 		// Create signed entry from RT-1
-		entry := createWBBEntry(t, wbbData, "RT-1", keys)
+		entry := createAggregateWBBEntry(t, wbbData, []string{"RT-1", "RT-2"})
 
 		resp := submitEntry(t, serverURL+"/submit", entry)
-		// Initially this should pass authentication but may fail policy check
-		// Once policy is implemented, this should check threshold
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("RT acc_pub_key submission response: %d - %s", resp.StatusCode, string(body))
 		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected RT acc_pub_key submission to succeed, got %d: %s", resp.StatusCode, string(body))
+		}
 	})
 
 	t.Run("RT cannot write other entry types", func(t *testing.T) {
@@ -147,6 +151,10 @@ func testSetupPhaseER(t *testing.T, serverURL string, keys map[string]ed25519.Pu
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("ER election_pub_key submission response: %d - %s", resp.StatusCode, string(body))
 		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected ER election_pub_key submission to succeed, got %d: %s", resp.StatusCode, string(body))
+		}
 	})
 
 	t.Run("ER can write pseudonymous_id_count", func(t *testing.T) {
@@ -155,8 +163,12 @@ func testSetupPhaseER(t *testing.T, serverURL string, keys map[string]ed25519.Pu
 
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
-		t.Logf("ER pseudonymous_id_count submission response: %d - %s", resp.StatusCode, string(body))
+		t.Logf("ER pseudonymous_id count response: %d - %s", resp.StatusCode, string(body))
 		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected ER election_pub_key submission to succeed, got %d: %s", resp.StatusCode, string(body))
+		}
 	})
 
 	t.Run("ER can write voter_id_merkle_root", func(t *testing.T) {
@@ -165,8 +177,12 @@ func testSetupPhaseER(t *testing.T, serverURL string, keys map[string]ed25519.Pu
 
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
-		t.Logf("ER voter_id_merkle_root submission response: %d - %s", resp.StatusCode, string(body))
+		t.Logf("ER voter_id merekle root submission response: %d - %s", resp.StatusCode, string(body))
 		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected ER election_pub_key submission to succeed, got %d: %s", resp.StatusCode, string(body))
+		}
 	})
 
 	t.Run("ER cannot write RT entry types", func(t *testing.T) {
@@ -192,6 +208,10 @@ func testVotingPhaseBB(t *testing.T, serverURL string, keys map[string]ed25519.P
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("BB ballot_digest submission response: %d - %s", resp.StatusCode, string(body))
 		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected BB ballot_digest submission to succeed, got %d: %s", resp.StatusCode, string(body))
+		}
 	})
 
 	t.Run("BB can write ballot_metadata", func(t *testing.T) {
@@ -202,6 +222,10 @@ func testVotingPhaseBB(t *testing.T, serverURL string, keys map[string]ed25519.P
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("BB ballot_metadata submission response: %d - %s", resp.StatusCode, string(body))
 		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected BB ballot_metadata submission to succeed, got %d: %s", resp.StatusCode, string(body))
+		}
 	})
 
 	t.Run("BB can write cast_intended_proof", func(t *testing.T) {
@@ -210,8 +234,12 @@ func testVotingPhaseBB(t *testing.T, serverURL string, keys map[string]ed25519.P
 
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
-		t.Logf("BB cast_intended_proof submission response: %d - %s", resp.StatusCode, string(body))
+		t.Logf("BB cast_as_intended_proof submission response: %d - %s", resp.StatusCode, string(body))
 		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected BB cast_as_intended_proof submission to succeed, got %d: %s", resp.StatusCode, string(body))
+		}
 	})
 }
 
@@ -232,42 +260,57 @@ func testTallyingPhaseBB(t *testing.T, serverURL string, keys map[string]ed25519
 func testTallyingPhaseTT(t *testing.T, serverURL string, keys map[string]ed25519.PublicKey) {
 	t.Run("TT can write mixed_ballots with threshold 3", func(t *testing.T) {
 		wbbData := "tallying,TT,mixed_ballots,3,mixed_shuffled_ballots"
-		entry := createWBBEntry(t, wbbData, "TT-1", keys)
-
+		entry := createAggregateWBBEntry(t, wbbData, []string{"TT-1", "TT-2", "TT-3"})
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("TT mixed_ballots submission response: %d - %s", resp.StatusCode, string(body))
 		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected TT re_encryption_proof submission to succeed, got %d: %s", resp.StatusCode, string(body))
+		}
 	})
 
 	t.Run("TT can write re_encryption_proof", func(t *testing.T) {
 		wbbData := "tallying,TT,re_encryption_proof,3,proof_of_re_encryption"
-		entry := createWBBEntry(t, wbbData, "TT-1", keys)
+		entry := createAggregateWBBEntry(t, wbbData, []string{"TT-1", "TT-2", "TT-3"})
 
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("TT re_encryption_proof submission response: %d - %s", resp.StatusCode, string(body))
 		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected TT re_encryption_proof submission to succeed, got %d: %s", resp.StatusCode, string(body))
+		}
 	})
 
 	t.Run("TT can write tally_result", func(t *testing.T) {
 		wbbData := "tallying,TT,tally_result,3,final_election_results"
-		entry := createWBBEntry(t, wbbData, "TT-1", keys)
+		entry := createAggregateWBBEntry(t, wbbData, []string{"TT-1", "TT-2", "TT-3"})
 
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("TT tally_result submission response: %d - %s", resp.StatusCode, string(body))
 		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected TT re_encryption_proof submission to succeed, got %d: %s", resp.StatusCode, string(body))
+		}
 	})
 
 	t.Run("TT can write tally_proof", func(t *testing.T) {
 		wbbData := "tallying,TT,tally_proof,3,proof_of_correct_tally"
-		entry := createWBBEntry(t, wbbData, "TT-1", keys)
+		entry := createAggregateWBBEntry(t, wbbData, []string{"TT-1", "TT-2", "TT-3"})
 
 		resp := submitEntry(t, serverURL+"/submit", entry)
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("TT tally_proof submission response: %d - %s", resp.StatusCode, string(body))
 		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected TT re_encryption_proof submission to succeed, got %d: %s", resp.StatusCode, string(body))
+		}
 	})
 }
 
@@ -359,43 +402,136 @@ func testThresholdEnforcement(t *testing.T, serverURL string, keys map[string]ed
 		t.Logf("ER threshold 1 submission response: %d - %s", resp.StatusCode, string(body))
 		resp.Body.Close()
 	})
+
+	// More controls
+	t.Run("RT aggregate signature requires two distinct RT signers", func(t *testing.T) {
+		// RT entries of type acc_pub_key require threshold 2.
+		// This test sends only one RT signer, so the server must reject the entry
+		// even if the BLS aggregate signature is otherwise well-formed.
+		wbbData := "setup,RT,acc_pub_key,2,test_acc_public_key_data"
+
+		entry := createAggregateWBBEntry(t, wbbData, []string{"RT-1"})
+
+		resp := submitEntry(t, serverURL+"/submit", entry)
+		body, _ := io.ReadAll(resp.Body)
+		t.Logf("RT aggregate with one signer response: %d - %s", resp.StatusCode, string(body))
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			t.Error("expected RT aggregate with one signer to be rejected")
+		}
+	})
+
+	t.Run("TT aggregate signature requires three distinct TT signers", func(t *testing.T) {
+		// TT entries of type mixed_ballots require threshold 3.
+		// This test provides only two TT signers, so the entry must not be accepted.
+		wbbData := "tallying,TT,mixed_ballots,3,mixed_shuffled_ballots"
+
+		entry := createAggregateWBBEntry(t, wbbData, []string{"TT-1", "TT-2"})
+
+		resp := submitEntry(t, serverURL+"/submit", entry)
+		body, _ := io.ReadAll(resp.Body)
+		t.Logf("TT aggregate with two signers response: %d - %s", resp.StatusCode, string(body))
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			t.Error("expected TT aggregate with two signers to be rejected")
+		}
+	})
+
+	t.Run("RT aggregate signature rejects duplicate signers", func(t *testing.T) {
+		// The threshold must be satisfied by distinct entities.
+		// Reusing the same signer twice must not count as two independent RT signatures.
+		wbbData := "setup,RT,acc_pub_key,2,test_acc_public_key_data"
+
+		entry := createAggregateWBBEntry(t, wbbData, []string{"RT-1", "RT-1"})
+
+		resp := submitEntry(t, serverURL+"/submit", entry)
+		body, _ := io.ReadAll(resp.Body)
+		t.Logf("RT aggregate with duplicate signer response: %d - %s", resp.StatusCode, string(body))
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			t.Error("expected RT aggregate with duplicate signer to be rejected")
+		}
+	})
+
+	t.Run("RT aggregate signature rejects signer with wrong role", func(t *testing.T) {
+		// All signers in an aggregate signature must belong to the role declared
+		// in the WBB entry. Here the entry claims role RT, but one signer is ER-1.
+		wbbData := "setup,RT,acc_pub_key,2,test_acc_public_key_data"
+
+		entry := createAggregateWBBEntry(t, wbbData, []string{"RT-1", "ER-1"})
+
+		resp := submitEntry(t, serverURL+"/submit", entry)
+		body, _ := io.ReadAll(resp.Body)
+		t.Logf("RT aggregate with wrong-role signer response: %d - %s", resp.StatusCode, string(body))
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			t.Error("expected RT aggregate with wrong-role signer to be rejected")
+		}
+	})
 }
 
 // ============ HELPER FUNCTIONS ============
 
 // generateTestEntityKeys creates keys for all entity types used in WBB
+
 var testEntityPrivateKeys map[string]ed25519.PrivateKey
+var testEntityBLSSigners map[string]*my_crypto.BLSSigner
+var testEntityBLSKeys map[string][]byte
 
 func generateTestEntityKeys(t *testing.T) map[string]ed25519.PublicKey {
 	keys := make(map[string]ed25519.PublicKey)
 
 	testEntityPrivateKeys = make(map[string]ed25519.PrivateKey)
+	testEntityBLSSigners = make(map[string]*my_crypto.BLSSigner)
+	testEntityBLSKeys = make(map[string][]byte)
 
 	addEntity := func(entityID string) {
 		pub, priv, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
-			t.Fatalf("failed to generate key for %s: %v", entityID, err)
+			t.Fatalf("failed to generate Ed25519 key for %s: %v", entityID, err)
 		}
 
 		keys[entityID] = pub
 		testEntityPrivateKeys[entityID] = priv
+
+		seed := make([]byte, 32)
+		if _, err := rand.Read(seed); err != nil {
+			t.Fatalf("failed to generate BLS seed for %s: %v", entityID, err)
+		}
+
+		// Test-only key hash. It only needs to be unique in this test setup.
+		keyHash := uint32(len(testEntityBLSSigners) + 1)
+
+		blsSigner, err := my_crypto.NewBLSSignerFromSeed(entityID, keyHash, seed)
+		if err != nil {
+			t.Fatalf("failed to generate BLS signer for %s: %v", entityID, err)
+		}
+
+		blsPub, err := blsSigner.PublicKeyBytes()
+		if err != nil {
+			t.Fatalf("failed to serialize BLS public key for %s: %v", entityID, err)
+		}
+
+		testEntityBLSSigners[entityID] = blsSigner
+		testEntityBLSKeys[entityID] = blsPub
 	}
-	// RT entities (need at least 2)
+
 	for i := 1; i <= 3; i++ {
 		addEntity(fmt.Sprintf("RT-%d", i))
 	}
 
-	// ER entities (need at least 1)
 	for i := 1; i <= 2; i++ {
 		addEntity(fmt.Sprintf("ER-%d", i))
 	}
 
-	// BB entities (need at least 1)
 	for i := 1; i <= 2; i++ {
 		addEntity(fmt.Sprintf("BB-%d", i))
 	}
 
-	// TT entities (need at least 3)
 	for i := 1; i <= 5; i++ {
 		addEntity(fmt.Sprintf("TT-%d", i))
 	}
@@ -433,3 +569,51 @@ func createWBBEntry(t *testing.T, wbbData, entityID string, keys map[string]ed25
 // submitEntry submits a signed entry to the server
 // NOTE: This function is defined in e2e_test.go, using that version
 // This comment is here to document that submitEntry should be imported from e2e_test.go
+
+func aggregateSignedMessage(data []byte, timestamp int64, entityIDs []string) []byte {
+	var buf bytes.Buffer
+	buf.Write(data)
+	buf.WriteString(fmt.Sprintf("%d", timestamp))
+
+	for _, entityID := range entityIDs {
+		buf.WriteString("|")
+		buf.WriteString(entityID)
+	}
+
+	h := sha256.Sum256(buf.Bytes())
+	return h[:]
+}
+
+func createAggregateWBBEntry(t *testing.T, wbbData string, entityIDs []string) ctlog.SignedEntry {
+	timestamp := time.Now().UnixMilli()
+	data := []byte(wbbData)
+
+	msg := aggregateSignedMessage(data, timestamp, entityIDs)
+
+	signatures := make([][]byte, 0, len(entityIDs))
+	for _, entityID := range entityIDs {
+		signer, ok := testEntityBLSSigners[entityID]
+		if !ok {
+			t.Fatalf("missing BLS signer for entity %s", entityID)
+		}
+
+		sig, err := signer.Sign(msg)
+		if err != nil {
+			t.Fatalf("failed to create BLS signature for %s: %v", entityID, err)
+		}
+
+		signatures = append(signatures, sig)
+	}
+
+	aggSig, err := my_crypto.AggregateSignaturesBytes(signatures)
+	if err != nil {
+		t.Fatalf("failed to aggregate BLS signatures: %v", err)
+	}
+
+	return ctlog.SignedEntry{
+		Data:               data,
+		EntityIDs:          entityIDs,
+		Timestamp:          timestamp,
+		AggregateSignature: aggSig,
+	}
+}

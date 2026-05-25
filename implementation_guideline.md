@@ -127,6 +127,8 @@ if err != nil || !allowed {
 - `RT_requires_threshold_2_for_acc_pub_key` (should fail with 403)
 - `TT_requires_threshold_3_for_mixed_ballots` (should fail with 403)
 
+// the last two tests pass but with 403 error
+
 ### Phase 4: Multi-Signature Support
 **Goal**: Handle entries requiring multiple signatures (threshold > 1)
 

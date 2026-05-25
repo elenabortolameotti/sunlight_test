@@ -310,3 +310,306 @@ If unclear about:
 **EntryType constants:** See `wbb_policy.go` lines 24-37
 
 **Phase and Role constants:** See `wbb_policy.go` lines 14-22
+
+---
+
+# Server-Side Staging Implementation (NEW)
+
+## Required Data Structure Changes
+
+### 1. Add Staging Types to `internal/ctlog/ctlog.go`
+
+**Location:** After Log struct definition, add:
+
+```go
+// StagingEntry tracks partial signatures for a WBB entry
+type StagingEntry struct {
+    WBBData       string
+    Phase         Phase
+    Role          Role
+    EntryType     EntryType
+    Threshold     int
+    Content       string
+
+    // Map of entityID -> submission
+    Submissions   map[string]*StagingSubmission
+
+    // For BLS: maintain running aggregate
+    RunningBLSAggregate []byte
+
+    // Tracking timestamps
+    FirstSubmissionAt int64  // When first entity submitted (for audit)
+    LastSubmissionAt  int64  // When last entity submitted (used for log timestamp)
+
+    IsPublished   bool
+    LeafIndex     int64
+}
+
+type StagingSubmission struct {
+    EntityID      string
+    Timestamp     int64
+    Signature     []byte    // Ed25519 signature
+    BLSSignature  []byte    // BLS signature (optional)
+}
+```
+
+### 2. Update Log Struct
+
+**Location:** In `Log` struct definition, add field:
+
+```go
+type Log struct {
+    // ... existing fields ...
+
+    // staging tracks partial signatures waiting for threshold
+    // Key: SHA256 hash of WBB data (phase,role,entry_type,threshold,content)
+    staging map[[32]byte]*StagingEntry
+}
+```
+
+### 3. Initialize Staging in LoadLog
+
+**Location:** In `LoadLog()` function, after creating Log struct:
+
+```go
+return &Log{
+    // ... existing fields ...
+    staging: make(map[[32]byte]*StagingEntry),
+}, nil
+```
+
+## Required Function Implementations
+
+### Function 1: `stageSubmission()`
+
+**Location:** `internal/ctlog/http.go`
+
+**Purpose:** Add a new submission to the staging area
+
+**Parameters:**
+- `contentHash [32]byte` - SHA256 of WBB data
+- `signedEntry SignedEntry` - The submitted entry
+- `wbbEntry WBBEntry` - Parsed WBB entry
+
+**Logic:**
+1. Check if staging entry exists for contentHash
+2. If not, create new StagingEntry
+3. Verify entity signature
+4. Add submission to staging
+5. For BLS: update running aggregate
+6. Return current signer count
+
+**Returns:** `(currentCount int, isNew bool, err error)`
+
+### Function 2: `checkThreshold()`
+
+**Location:** `internal/ctlog/http.go`
+
+**Purpose:** Check if threshold is met for a staging entry
+
+**Parameters:**
+- `contentHash [32]byte`
+
+**Logic:**
+1. Look up staging entry
+2. Count unique submissions
+3. Return count and whether >= threshold
+
+**Returns:** `(count int, thresholdMet bool, err error)`
+
+### Function 3: `finalizeEntry()`
+
+**Location:** `internal/ctlog/http.go`
+
+**Purpose:** Convert staging entry to final log entry when threshold met
+
+**Parameters:**
+- `contentHash [32]byte`
+- `ctx context.Context`
+
+**Logic:**
+1. Get staging entry
+2. Create final SignedEntry:
+   - Set Data from WBBData
+   - Set Timestamp (first submission time)
+   - For Ed25519: collect all signatures and entityIDs
+   - For BLS: use final aggregate signature
+   - Set SigAlgorithm field
+3. Store in log (use existing addLeafToPool)
+4. Mark staging as published
+5. Set LeafIndex
+
+**Returns:** `(leafIndex int64, err error)`
+
+### Function 4: `appendToPublishedEntry()`
+
+**Location:** `internal/ctlog/http.go`
+
+**Purpose:** Add late arrival signature to already-published entry
+
+**Parameters:**
+- `contentHash [32]byte`
+- `signedEntry SignedEntry`
+- `entityID string`
+
+**Logic:**
+1. Get staging entry (must be published)
+2. Verify new signature
+3. Add to submissions map
+4. For Ed25519: append to signatures list
+5. For BLS: re-aggregate
+6. Return updated info
+
+**Returns:** `(leafIndex int64, totalSigners int, err error)`
+
+### Function 5: `computeContentHash()`
+
+**Location:** `internal/ctlog/http.go`
+
+**Purpose:** Generate unique hash for WBB content
+
+**Parameters:**
+- `wbbData string` - Full WBB entry string
+
+**Logic:**
+- SHA256(wbbData)
+
+**Returns:** `[32]byte`
+
+
+### New Flow:
+
+```
+1. Parse JSON -> SignedEntry
+2. Validate basic fields (data, timestamp)
+3. Check timestamp validity (±5min)
+4. Parse WBB entry
+5. Validate WBB format
+6. Check policy (CheckWBBWritePolicy)
+7. Compute contentHash = SHA256(signedEntry.Data)
+8. Check if already published:
+   - If yes: call appendToPublishedEntry()
+   - Return 200 OK with "appended" status
+9. Check if in staging:
+   - If yes: add submission to existing staging
+   - If no: create new staging entry
+10. Verify signature (single or BLS)
+11. Call checkThreshold()
+12. If threshold met:
+    - Call finalizeEntry()
+    - Return 200 OK with "published" status
+13. If threshold not met:
+    - Return 202 Accepted with "pending" status
+    - Include current count and required count
+```
+
+### Response Formats:
+
+**202 Accepted (Pending):**
+```json
+{
+  "status": "pending",
+  "content_hash": "abc123...",
+  "current_signers": 2,
+  "required_signers": 3,
+  "signers": ["TT-1", "TT-2"],
+  "message": "need 1 more signature"
+}
+```
+
+**200 OK (Published):**
+```json
+{
+  "status": "published",
+  "leaf_index": 42,
+  "timestamp": 1715927045000,
+  "data_hash": "base64hash",
+  "signers": ["TT-1", "TT-2", "TT-3"],
+  "algorithm": "ed25519",
+  "signatures": [[...], [...], [...]]
+}
+```
+
+**200 OK (Appended):**
+```json
+{
+  "status": "appended",
+  "leaf_index": 42,
+  "total_signers": 4,
+  "signers": ["TT-1", "TT-2", "TT-3", "TT-4"]
+}
+```
+
+## Updated SignedEntry Storage Format
+
+When stored in the log (after threshold met), SignedEntry should be:
+
+```go
+type SignedEntry struct {
+    Data               []byte   `json:"data"`                          // WBB entry
+     Timestamp          int64    `json:"timestamp"`                     // Final submission time (when threshold met) - NOT first submission
+    SigAlgorithm       string   `json:"sig_algorithm"`                 // "ed25519" or "bls"
+
+    // For single-sig (threshold=1)
+    EntityID           string   `json:"entity_id,omitempty"`
+    Signature          []byte   `json:"signature,omitempty"`
+
+    // For multi-sig Ed25519
+    EntityIDs          []string `json:"entity_ids,omitempty"`
+    Signatures         [][]byte `json:"signatures,omitempty"`
+
+    // For multi-sig BLS
+    AggregateSignature []byte   `json:"aggregate_signature,omitempty"`
+}
+```
+
+## Implementation Order
+
+### Phase 1: Data Structures
+1. Add StagingEntry and StagingSubmission types to ctlog.go
+2. Add staging map to Log struct
+3. Initialize staging in LoadLog
+
+### Phase 2: Core Functions
+1. Implement computeContentHash()
+2. Implement stageSubmission()
+3. Implement checkThreshold()
+4. Test basic staging without threshold detection
+
+### Phase 3: Finalization
+1. Implement finalizeEntry()
+2. Implement appendToPublishedEntry()
+3. Test threshold detection and finalization
+
+### Phase 4: Integration
+1. Rewrite submitEntry() with new flow
+2. Implement response formatters
+3. Test all scenarios
+
+### Phase 5: Algorithm Support
+1. Ensure Ed25519 staging works (multiple signatures stored)
+2. Ensure BLS staging works (aggregate maintained)
+3. Test both paths thoroughly
+
+## Testing Commands
+
+```bash
+# Run all staging tests
+go test ./internal/ctlog/... -v -run TestStagingMechanism
+
+# Run specific test groups
+go test ./internal/ctlog/... -v -run TestStagingMechanism/Basic_Staging
+go test ./internal/ctlog/... -v -run TestStagingMechanism/Threshold_Detection
+go test ./internal/ctlog/... -v -run TestStagingMechanism/Late_Arrivals
+go test ./internal/ctlog/... -v -run TestStagingMechanism/Conflict_Resolution
+go test ./internal/ctlog/... -v -run TestStagingMechanism/Duplicate_Signer_Prevention
+
+# Run all WBB tests (old + new)
+go test ./internal/ctlog/... -v -run "TestWBB|TestStaging"
+```
+
+## Files to Modify
+
+1. `internal/ctlog/ctlog.go` - Add staging types and initialization
+2. `internal/ctlog/http.go` - Implement staging logic and rewrite submitEntry()
+3. `internal/ctlog/staging_e2e_test.go` - Tests are already written (this file)

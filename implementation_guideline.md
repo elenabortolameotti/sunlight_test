@@ -399,6 +399,16 @@ return &Log{
 5. For BLS: update running aggregate
 6. Return current signer count
 
+**Better**
+1. Compute contentHash
+2. Check/create staging entry
+3. Verify the signer identity and role
+4. Verify the signature
+5. Check that the same entity has not already submitted
+6. Add submission
+7. For BLS: update aggregate only after all checks pass
+8. Return current distinct signer count
+
 **Returns:** `(currentCount int, isNew bool, err error)`
 
 ### Function 2: `checkThreshold()`

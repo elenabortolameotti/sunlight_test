@@ -55,6 +55,47 @@ type Log struct {
 
 	// Added
 	entityBLSKeys map[string][]byte
+	stagingMu     sync.Mutex
+	staging       map[[32]byte]*StagingEntry
+}
+
+// StagingEntry tracks partial signatures for a WBB entry until the required
+// threshold is reached.
+type StagingEntry struct {
+	WBBData   string
+	Phase     Phase
+	Role      Role
+	EntryType EntryType
+	Threshold int
+	Content   string
+
+	// Submissions maps each signer entity ID to its partial submission.
+	// This also prevents the same entity from being counted twice.
+	Submissions map[string]*StagingSubmission
+
+	// RunningBLSAggregate stores the aggregate signature accumulated so far
+	// when BLS signatures are used.
+	RunningBLSAggregate []byte
+
+	// FirstSubmissionAt is useful for auditability.
+	// LastSubmissionAt is updated whenever a new signer contributes.
+	FirstSubmissionAt int64
+	LastSubmissionAt  int64
+
+	IsPublished bool
+	LeafIndex   int64
+}
+
+// StagingSubmission stores the signature material provided by one entity.
+type StagingSubmission struct {
+	EntityID  string
+	Timestamp int64
+
+	// Ed25519 partial signature.
+	Signature []byte
+
+	// BLS partial signature, if the staged entry uses BLS.
+	BLSSignature []byte
 }
 
 type treeWithTimestamp struct {
@@ -290,6 +331,7 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 		cacheWrite:     cacheWrite,
 		entityKeys:     entityKeys,
 		entityBLSKeys:  entityBLSKeys,
+		staging:        make(map[[32]byte]*StagingEntry),
 	}, nil
 }
 

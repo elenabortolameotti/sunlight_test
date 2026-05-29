@@ -41,6 +41,21 @@ type SignedEntry struct {
 	// BLS aggregate format.
 	// Used when a finalized entry stores an aggregate BLS signature.
 	AggregateSignature []byte `json:"aggregate_signature,omitempty"`
+
+	// BLS partial signature format.
+	// Used when a single entity submits a BLS partial signature during staging.
+	BLSSignature []byte `json:"bls_signature,omitempty"`
+
+	// SignerTimestamps preserves every entity's original submission timestamp.
+	// This is for auditability: the log entry Timestamp is LastSubmissionAt
+	// (for validation), but all individual timestamps are kept here.
+	SignerTimestamps []SignerTimestamp `json:"signer_timestamps,omitempty"`
+}
+
+// SignerTimestamp records a single entity's submission time.
+type SignerTimestamp struct {
+	EntityID  string `json:"entity_id"`
+	Timestamp int64  `json:"timestamp"`
 }
 
 // IsTimestampValid checks if the timestamp is within acceptable window
@@ -547,9 +562,10 @@ type stagingPublishedResponse struct {
 	RequiredSigners    int      `json:"required_signers"`
 	Signers            []string `json:"signers"`
 	Message            string   `json:"message"`
-	Algorithm          string   `json:"algorithm,omitempty"`
-	Signatures         [][]byte `json:"signatures,omitempty"`
-	AggregateSignature []byte   `json:"aggregate_signature,omitempty"`
+	Algorithm          string            `json:"algorithm,omitempty"`
+	Signatures         [][]byte          `json:"signatures,omitempty"`
+	AggregateSignature []byte            `json:"aggregate_signature,omitempty"`
+	SignerTimestamps   []SignerTimestamp `json:"signer_timestamps,omitempty"`
 }
 
 func (l *Log) makePublishedResponse(contentHash [32]byte, leafIndex int64, currentCount int, requiredCount int) ([]byte, error) {
@@ -578,6 +594,15 @@ func (l *Log) makePublishedResponse(contentHash [32]byte, leafIndex int64, curre
 
 	l.stagingMu.Unlock()
 
+	// Collect all individual submission timestamps for audit
+	signerTimestamps := make([]SignerTimestamp, 0, len(signers))
+	for _, entityID := range signers {
+		signerTimestamps = append(signerTimestamps, SignerTimestamp{
+			EntityID:  entityID,
+			Timestamp: staged.Submissions[entityID].Timestamp,
+		})
+	}
+
 	rsp := stagingPublishedResponse{
 		Status:          "published",
 		ContentHash:     hex.EncodeToString(contentHash[:]),
@@ -590,18 +615,20 @@ func (l *Log) makePublishedResponse(contentHash [32]byte, leafIndex int64, curre
 		Algorithm:          algorithm,
 		Signatures:         signatures,
 		AggregateSignature: aggregateSignature,
+		SignerTimestamps:   signerTimestamps,
 	}
 
 	return json.Marshal(rsp)
 }
 
 type stagingAppendedResponse struct {
-	Status       string   `json:"status"`
-	ContentHash  string   `json:"content_hash"`
-	LeafIndex    int64    `json:"leaf_index"`
-	TotalSigners int      `json:"total_signers"`
-	Signers      []string `json:"signers"`
-	Message      string   `json:"message"`
+	Status           string            `json:"status"`
+	ContentHash      string            `json:"content_hash"`
+	LeafIndex        int64             `json:"leaf_index"`
+	TotalSigners     int               `json:"total_signers"`
+	Signers          []string          `json:"signers"`
+	Message          string            `json:"message"`
+	SignerTimestamps []SignerTimestamp `json:"signer_timestamps,omitempty"`
 }
 
 func (l *Log) makeAppendedResponse(contentHash [32]byte, leafIndex int64, totalSigners int) ([]byte, error) {
@@ -615,13 +642,23 @@ func (l *Log) makeAppendedResponse(contentHash [32]byte, leafIndex int64, totalS
 	signers := stagedSigners(staged)
 	l.stagingMu.Unlock()
 
+	// Collect all individual submission timestamps for audit
+	signerTimestamps := make([]SignerTimestamp, 0, len(signers))
+	for _, entityID := range signers {
+		signerTimestamps = append(signerTimestamps, SignerTimestamp{
+			EntityID:  entityID,
+			Timestamp: staged.Submissions[entityID].Timestamp,
+		})
+	}
+
 	rsp := stagingAppendedResponse{
-		Status:       "appended",
-		ContentHash:  hex.EncodeToString(contentHash[:]),
-		LeafIndex:    leafIndex,
-		TotalSigners: totalSigners,
-		Signers:      signers,
-		Message:      "signature appended to already published entry",
+		Status:           "appended",
+		ContentHash:      hex.EncodeToString(contentHash[:]),
+		LeafIndex:        leafIndex,
+		TotalSigners:     totalSigners,
+		Signers:          signers,
+		Message:          "signature appended to already published entry",
+		SignerTimestamps: signerTimestamps,
 	}
 
 	return json.Marshal(rsp)

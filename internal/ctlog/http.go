@@ -453,11 +453,16 @@ func (l *Log) finalizeEntry(contentHash [32]byte, ctx context.Context) (leafInde
 		return 0, fmtErrorf("staging entry not found")
 	}
 
-	// If another request already finalized this staging entry, just return
-	// the existing leaf index instead of publishing the same content twice.
+	// If the entry has already been published, return the existing leaf index.
+	// LeafIndex == -1 means that another goroutine is currently publishing it.
 	if staged.IsPublished {
 		leafIndex := staged.LeafIndex
 		l.stagingMu.Unlock()
+
+		if leafIndex < 0 {
+			return 0, fmtErrorf("entry already being published")
+		}
+
 		return leafIndex, nil
 	}
 
@@ -490,10 +495,9 @@ func (l *Log) finalizeEntry(contentHash [32]byte, ctx context.Context) (leafInde
 	}
 
 	if len(staged.RunningBLSAggregate) > 0 {
-		// BLS case: the staging entry already maintains the aggregate
-		// signature, so the finalized log entry stores the aggregate.
+		// BLS case: copy the aggregate signature while still holding the lock.
 		finalEntry.SigAlgorithm = "bls"
-		finalEntry.AggregateSignature = staged.RunningBLSAggregate
+		finalEntry.AggregateSignature = append([]byte(nil), staged.RunningBLSAggregate...)
 	} else {
 		// Ed25519 case: collect one signature for each distinct signer.
 		finalEntry.SigAlgorithm = "ed25519"
@@ -501,7 +505,7 @@ func (l *Log) finalizeEntry(contentHash [32]byte, ctx context.Context) (leafInde
 		signatures := make([][]byte, 0, len(entityIDs))
 		for _, entityID := range entityIDs {
 			submission := staged.Submissions[entityID]
-			signatures = append(signatures, submission.Signature)
+			signatures = append(signatures, append([]byte(nil), submission.Signature...))
 		}
 
 		finalEntry.Signatures = signatures
@@ -513,33 +517,44 @@ func (l *Log) finalizeEntry(contentHash [32]byte, ctx context.Context) (leafInde
 		return 0, fmtErrorf("failed to encode finalized entry: %w", err)
 	}
 
-	// Do not hold the staging lock while waiting for sequencing.
-	// addLeafToPool / waitLeaf can block, and holding the lock here would
-	// unnecessarily block other submissions.
+	// Atomic transition:
+	// from "not published" to "publishing in progress".
+	//
+	// This must happen before releasing stagingMu. Otherwise another goroutine
+	// could also pass the IsPublished check and publish the same content again.
+	staged.IsPublished = true
+	staged.LeafIndex = -1
+
 	l.stagingMu.Unlock()
 
 	e := &PendingLogEntry{Data: entryBytes}
 
 	waitLeaf, _ := l.addLeafToPool(ctx, e)
 	seq, err := waitLeaf(ctx)
-	if err == errPoolFull || err == errEvicted {
-		return 0, err
-	} else if errors.As(err, new(SunsetLogError)) {
-		return 0, err
-	} else if err != nil {
+	if err != nil {
+		// Publishing failed. Roll back the publishing marker so the entry can
+		// be retried later.
+		l.stagingMu.Lock()
+		if staged, ok := l.staging[contentHash]; ok && staged.LeafIndex == -1 {
+			staged.IsPublished = false
+			staged.LeafIndex = 0
+		}
+		l.stagingMu.Unlock()
+
+		if err == errPoolFull || err == errEvicted {
+			return 0, err
+		}
+		if errors.As(err, new(SunsetLogError)) {
+			return 0, err
+		}
 		return 0, fmtErrorf("failed to sequence finalized entry: %w", err)
 	}
 
 	l.stagingMu.Lock()
-	defer l.stagingMu.Unlock()
-
-	staged, ok = l.staging[contentHash]
-	if !ok {
-		return seq.LeafIndex, nil
+	if staged, ok := l.staging[contentHash]; ok {
+		staged.LeafIndex = seq.LeafIndex
 	}
-
-	staged.IsPublished = true
-	staged.LeafIndex = seq.LeafIndex
+	l.stagingMu.Unlock()
 
 	return seq.LeafIndex, nil
 }
@@ -922,7 +937,6 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 		staged, exists := l.staging[contentHash]
 		alreadyPublished := exists && staged.IsPublished
 		l.stagingMu.Unlock()
-
 		if alreadyPublished {
 			leafIndex, totalSigners, err := l.appendToPublishedEntry(
 				contentHash,
@@ -930,6 +944,15 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 				signedEntry.EntityID,
 			)
 			if err != nil {
+				errMsg := err.Error()
+
+				if strings.Contains(errMsg, "duplicate signer") ||
+					strings.Contains(errMsg, "entry already published") ||
+					strings.Contains(errMsg, "entry already being published") ||
+					strings.Contains(errMsg, "signature algorithm mismatch") {
+					return nil, http.StatusConflict, err
+				}
+
 				return nil, http.StatusForbidden, err
 			}
 
@@ -943,7 +966,12 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 
 		_, _, err := l.stageSubmission(contentHash, signedEntry, wbbEntry)
 		if err != nil {
-			if strings.Contains(err.Error(), "signature algorithm mismatch") {
+			errMsg := err.Error()
+
+			if strings.Contains(errMsg, "signature algorithm mismatch") ||
+				strings.Contains(errMsg, "duplicate signer") ||
+				strings.Contains(errMsg, "entry already published") ||
+				strings.Contains(errMsg, "entry already being published") {
 				return nil, http.StatusConflict, err
 			}
 
@@ -963,9 +991,15 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 
 			return rspBytes, http.StatusAccepted, nil
 		}
-
 		leafIndex, err := l.finalizeEntry(contentHash, ctx)
 		if err != nil {
+			errMsg := err.Error()
+
+			if strings.Contains(errMsg, "entry already being published") ||
+				strings.Contains(errMsg, "entry already published") {
+				return nil, http.StatusConflict, err
+			}
+
 			return nil, http.StatusInternalServerError, err
 		}
 

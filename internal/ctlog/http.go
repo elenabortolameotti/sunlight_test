@@ -676,30 +676,43 @@ func (l *Log) finalizeEntry(contentHash [32]byte, ctx context.Context) (leafInde
 	return seq.LeafIndex, nil
 }
 
-// 1. esiste uno staging per quel contentHash;
-// 2. quello staging è già pubblicato;
-// 3. entityID coincide con signedEntry.EntityID;
-// 4. i dati firmati sono gli stessi della entry già pubblicata;
-// 5. il signer non è già presente;
-// 6. la firma Ed25519 è valida;
-// 7. il ruolo dell’entità è corretto.
-func (l *Log) appendToPublishedEntry(contentHash [32]byte, signedEntry SignedEntry, entityID string) (leafIndex int64, totalSigners int, err error) {
+// appendToPublishedEntry handles a valid late arrival for an entry that has
+// already been published.
+//
+// Important: a Merkle tree leaf is immutable. Therefore, a late signature
+// cannot be appended to the already published leaf. Instead, this function
+// creates a new log entry whose data is "ref:<referencedLeaf>", where
+// referencedLeaf is the previously published leaf index.
+//
+// The staging area is still updated so that it tracks the latest known state,
+// while the append-only log stores the full history.
+func (l *Log) appendToPublishedEntry(
+	contentHash [32]byte,
+	signedEntry SignedEntry,
+	entityID string,
+	ctx context.Context,
+) (referencedLeaf int64, newLeafIndex int64, totalSigners int, err error) {
 	l.stagingMu.Lock()
 
 	staged, ok := l.staging[contentHash]
 	if !ok {
 		l.stagingMu.Unlock()
-		return 0, 0, fmtErrorf("staging entry not found")
+		return 0, 0, 0, fmtErrorf("staging entry not found")
 	}
 
 	if !staged.IsPublished {
 		l.stagingMu.Unlock()
-		return 0, 0, fmtErrorf("staging entry is not published")
+		return 0, 0, 0, fmtErrorf("staging entry is not published")
+	}
+
+	if staged.LeafIndex < 0 {
+		l.stagingMu.Unlock()
+		return 0, 0, 0, fmtErrorf("entry already being published")
 	}
 
 	if signedEntry.EntityID != entityID {
 		l.stagingMu.Unlock()
-		return 0, 0, fmtErrorf(
+		return 0, 0, 0, fmtErrorf(
 			"entity ID mismatch: got %s, expected %s",
 			signedEntry.EntityID,
 			entityID,
@@ -708,55 +721,61 @@ func (l *Log) appendToPublishedEntry(contentHash [32]byte, signedEntry SignedEnt
 
 	if string(signedEntry.Data) != staged.WBBData {
 		l.stagingMu.Unlock()
-		return 0, 0, fmtErrorf("submitted data does not match published staging entry")
+		return 0, 0, 0, fmtErrorf("submitted data does not match published staging entry")
 	}
 
 	if _, exists := staged.Submissions[entityID]; exists {
+		leafIndex := staged.LeafIndex
+		count := len(staged.Submissions)
 		l.stagingMu.Unlock()
-		return staged.LeafIndex, len(staged.Submissions), fmtErrorf("duplicate signer: %s", entityID)
+		return leafIndex, leafIndex, count, fmtErrorf("duplicate signer: %s", entityID)
 	}
 
-	wbbEntry, err := ParseWBBEntry(staged.WBBData)
-	if err != nil {
-		l.stagingMu.Unlock()
-		return 0, 0, fmtErrorf("invalid staged WBB data: %w", err)
-	}
+	// Copy the data needed for signature verification before releasing the lock.
+	wbbData := staged.WBBData
+	stagedRole := staged.Role
+	sigAlgorithm := staged.SigAlgorithm
 
 	l.stagingMu.Unlock()
 
+	wbbEntry, err := ParseWBBEntry(wbbData)
+	if err != nil {
+		return 0, 0, 0, fmtErrorf("invalid staged WBB data: %w", err)
+	}
+
 	// Even if the entry is already published, the late arrival must still be
 	// a valid signature from an entity with the correct role.
-	switch staged.SigAlgorithm {
+	switch sigAlgorithm {
 	case "ed25519":
 		if err := l.verifySingleWBBEntry(signedEntry, wbbEntry); err != nil {
-			return 0, 0, err
+			return 0, 0, 0, err
 		}
 
 	case "bls":
 		if len(signedEntry.BLSSignature) == 0 {
-			return 0, 0, fmtErrorf("staging entry uses BLS, expected bls_signature")
+			return 0, 0, 0, fmtErrorf("staging entry uses BLS, expected bls_signature")
 		}
 
 		if len(signedEntry.Signature) > 0 {
-			return 0, 0, fmtErrorf("staging entry uses BLS, got ed25519 signature")
+			return 0, 0, 0, fmtErrorf("staging entry uses BLS, got ed25519 signature")
 		}
 
 		entityRole, err := roleFromEntityID(signedEntry.EntityID)
 		if err != nil {
-			return 0, 0, fmtErrorf("invalid entity ID: %w", err)
+			return 0, 0, 0, fmtErrorf("invalid entity ID: %w", err)
 		}
 
-		if entityRole != staged.Role {
-			return 0, 0, fmtErrorf(
+		if entityRole != stagedRole {
+			return 0, 0, 0, fmtErrorf(
 				"entity %s cannot write as role %s",
 				signedEntry.EntityID,
-				staged.Role,
+				stagedRole,
 			)
 		}
 
 		blsPubKey, exists := l.entityBLSKeys[signedEntry.EntityID]
 		if !exists {
-			return 0, 0, fmtErrorf("unknown BLS entity: %s", signedEntry.EntityID)
+			return 0, 0, 0, fmtErrorf("unknown BLS entity: %s", signedEntry.EntityID)
 		}
 
 		msgInput := make([]byte, 0, len(signedEntry.Data)+len(signedEntry.EntityID)+20)
@@ -772,31 +791,44 @@ func (l *Log) appendToPublishedEntry(contentHash [32]byte, signedEntry SignedEnt
 			signedEntry.BLSSignature,
 		)
 		if err != nil {
-			return 0, 0, fmtErrorf("failed to verify BLS signature from %s: %w", signedEntry.EntityID, err)
+			return 0, 0, 0, fmtErrorf("failed to verify BLS signature from %s: %w", signedEntry.EntityID, err)
 		}
 		if !ok {
-			return 0, 0, fmtErrorf("invalid BLS signature from %s", signedEntry.EntityID)
+			return 0, 0, 0, fmtErrorf("invalid BLS signature from %s", signedEntry.EntityID)
 		}
 
 	default:
-		return 0, 0, fmtErrorf("unsupported staging signature algorithm: %s", staged.SigAlgorithm)
+		return 0, 0, 0, fmtErrorf("unsupported staging signature algorithm: %s", sigAlgorithm)
 	}
 
 	l.stagingMu.Lock()
-	defer l.stagingMu.Unlock()
 
 	staged, ok = l.staging[contentHash]
 	if !ok {
-		return 0, 0, fmtErrorf("staging entry not found")
+		l.stagingMu.Unlock()
+		return 0, 0, 0, fmtErrorf("staging entry not found")
 	}
 
 	if !staged.IsPublished {
-		return 0, 0, fmtErrorf("staging entry is not published")
+		l.stagingMu.Unlock()
+		return 0, 0, 0, fmtErrorf("staging entry is not published")
+	}
+
+	if staged.LeafIndex < 0 {
+		l.stagingMu.Unlock()
+		return 0, 0, 0, fmtErrorf("entry already being published")
 	}
 
 	if _, exists := staged.Submissions[entityID]; exists {
-		return staged.LeafIndex, len(staged.Submissions), fmtErrorf("duplicate signer: %s", entityID)
+		leafIndex := staged.LeafIndex
+		count := len(staged.Submissions)
+		l.stagingMu.Unlock()
+		return leafIndex, leafIndex, count, fmtErrorf("duplicate signer: %s", entityID)
 	}
+
+	referencedLeaf = staged.LeafIndex
+	oldLastSubmissionAt := staged.LastSubmissionAt
+	oldBLSAggregate := append([]byte(nil), staged.RunningBLSAggregate...)
 
 	staged.Submissions[entityID] = &StagingSubmission{
 		EntityID:     entityID,
@@ -815,7 +847,9 @@ func (l *Log) appendToPublishedEntry(contentHash [32]byte, signedEntry SignedEnt
 			})
 			if err != nil {
 				delete(staged.Submissions, entityID)
-				return 0, 0, fmtErrorf("failed to update BLS aggregate for late arrival: %w", err)
+				staged.RunningBLSAggregate = oldBLSAggregate
+				l.stagingMu.Unlock()
+				return 0, 0, 0, fmtErrorf("failed to update BLS aggregate for late arrival: %w", err)
 			}
 
 			staged.RunningBLSAggregate = aggregate
@@ -826,7 +860,66 @@ func (l *Log) appendToPublishedEntry(contentHash [32]byte, signedEntry SignedEnt
 		staged.LastSubmissionAt = signedEntry.Timestamp
 	}
 
-	return staged.LeafIndex, len(staged.Submissions), nil
+	totalSigners = len(staged.Submissions)
+
+	refEntry := SignedEntry{
+		Data:         []byte(fmt.Sprintf("ref:%d", referencedLeaf)),
+		Timestamp:    signedEntry.Timestamp,
+		EntityID:     entityID,
+		SigAlgorithm: staged.SigAlgorithm,
+	}
+
+	switch staged.SigAlgorithm {
+	case "ed25519":
+		refEntry.Signature = signedEntry.Signature
+
+	case "bls":
+		refEntry.BLSSignature = signedEntry.BLSSignature
+		refEntry.AggregateSignature = append([]byte(nil), staged.RunningBLSAggregate...)
+	}
+
+	entryBytes, err := json.Marshal(refEntry)
+	if err != nil {
+		delete(staged.Submissions, entityID)
+		staged.LastSubmissionAt = oldLastSubmissionAt
+		staged.RunningBLSAggregate = oldBLSAggregate
+		l.stagingMu.Unlock()
+		return 0, 0, 0, fmtErrorf("failed to encode late arrival reference entry: %w", err)
+	}
+
+	l.stagingMu.Unlock()
+
+	e := &PendingLogEntry{Data: entryBytes}
+
+	waitLeaf, _ := l.addLeafToPool(ctx, e)
+	seq, err := waitLeaf(ctx)
+	if err != nil {
+		l.stagingMu.Lock()
+		if staged, ok := l.staging[contentHash]; ok {
+			delete(staged.Submissions, entityID)
+			staged.LastSubmissionAt = oldLastSubmissionAt
+			staged.RunningBLSAggregate = oldBLSAggregate
+		}
+		l.stagingMu.Unlock()
+
+		if err == errPoolFull || err == errEvicted {
+			return 0, 0, 0, err
+		}
+		if errors.As(err, new(SunsetLogError)) {
+			return 0, 0, 0, err
+		}
+		return 0, 0, 0, fmtErrorf("failed to sequence late arrival reference entry: %w", err)
+	}
+
+	newLeafIndex = seq.LeafIndex
+
+	l.stagingMu.Lock()
+	if staged, ok := l.staging[contentHash]; ok {
+		staged.LeafIndex = newLeafIndex
+	}
+	l.stagingMu.Unlock()
+
+	return referencedLeaf, newLeafIndex, totalSigners, nil
 }
 
 type stagingPendingResponse struct {
@@ -980,6 +1073,7 @@ func (l *Log) makeGracePeriodResponse(contentHash [32]byte, currentCount int, re
 type stagingAppendedResponse struct {
 	Status           string            `json:"status"`
 	ContentHash      string            `json:"content_hash"`
+	ReferencedLeaf   int64             `json:"referenced_leaf"`
 	LeafIndex        int64             `json:"leaf_index"`
 	TotalSigners     int               `json:"total_signers"`
 	Signers          []string          `json:"signers"`
@@ -987,7 +1081,7 @@ type stagingAppendedResponse struct {
 	SignerTimestamps []SignerTimestamp `json:"signer_timestamps,omitempty"`
 }
 
-func (l *Log) makeAppendedResponse(contentHash [32]byte, leafIndex int64, totalSigners int) ([]byte, error) {
+func (l *Log) makeAppendedResponse(contentHash [32]byte, referencedLeaf int64, newLeafIndex int64, totalSigners int) ([]byte, error) {
 	l.stagingMu.Lock()
 	staged, ok := l.staging[contentHash]
 	if !ok {
@@ -1010,10 +1104,11 @@ func (l *Log) makeAppendedResponse(contentHash [32]byte, leafIndex int64, totalS
 	rsp := stagingAppendedResponse{
 		Status:           "appended",
 		ContentHash:      hex.EncodeToString(contentHash[:]),
-		LeafIndex:        leafIndex,
+		ReferencedLeaf:   referencedLeaf,
+		LeafIndex:        newLeafIndex,
 		TotalSigners:     totalSigners,
 		Signers:          signers,
-		Message:          "signature appended to already published entry",
+		Message:          "late arrival appended as new log entry",
 		SignerTimestamps: signerTimestamps,
 	}
 
@@ -1093,10 +1188,11 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 		alreadyPublished := exists && staged.IsPublished
 		l.stagingMu.Unlock()
 		if alreadyPublished {
-			leafIndex, totalSigners, err := l.appendToPublishedEntry(
+			referencedLeaf, newLeafIndex, totalSigners, err := l.appendToPublishedEntry(
 				contentHash,
 				signedEntry,
 				signedEntry.EntityID,
+				ctx,
 			)
 			if err != nil {
 				errMsg := err.Error()
@@ -1111,7 +1207,7 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 				return nil, http.StatusForbidden, err
 			}
 
-			rspBytes, err := l.makeAppendedResponse(contentHash, leafIndex, totalSigners)
+			rspBytes, err := l.makeAppendedResponse(contentHash, referencedLeaf, newLeafIndex, totalSigners)
 			if err != nil {
 				return nil, http.StatusInternalServerError, fmtErrorf("failed to encode appended response: %w", err)
 			}

@@ -431,6 +431,26 @@ func (l *Log) stageSubmission(contentHash [32]byte, signedEntry SignedEntry, wbb
 	return len(staged.Submissions), isNew, nil
 }
 
+// cleanupPublishedStagingForPhase removes published staging entries belonging
+// to the given phase.
+//
+// This is only a memory cleanup: published entries are already stored in the
+// append-only log, so removing them from the in-memory staging map does not
+// remove anything from the Merkle tree.
+//
+// Unpublished entries are deliberately kept, because deleting them could lose
+// partial signatures that have not reached publication yet.
+func (l *Log) cleanupPublishedStagingForPhase(phase Phase) {
+	l.stagingMu.Lock()
+	defer l.stagingMu.Unlock()
+
+	for contentHash, staged := range l.staging {
+		if staged.IsPublished && staged.Phase == phase {
+			delete(l.staging, contentHash)
+		}
+	}
+}
+
 func (l *Log) checkThreshold(contentHash [32]byte) (count int, thresholdMet bool, err error) {
 	l.stagingMu.Lock()
 	defer l.stagingMu.Unlock()

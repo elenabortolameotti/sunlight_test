@@ -1115,6 +1115,27 @@ func (l *Log) makeAppendedResponse(contentHash [32]byte, referencedLeaf int64, n
 	return json.Marshal(rsp)
 }
 
+func statusCodeForStagingError(err error, fallback int) int {
+	if err == nil {
+		return fallback
+	}
+
+	errMsg := err.Error()
+
+	if strings.Contains(errMsg, "staging entry not found") {
+		return http.StatusNotFound
+	}
+
+	if strings.Contains(errMsg, "duplicate signer") ||
+		strings.Contains(errMsg, "already published") ||
+		strings.Contains(errMsg, "already being published") ||
+		strings.Contains(errMsg, "signature algorithm mismatch") {
+		return http.StatusConflict
+	}
+
+	return fallback
+}
+
 func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response []byte, code int, err error) {
 	labels := prometheus.Labels{"error": "", "source": "", "reused": ""}
 	defer func() {
@@ -1195,16 +1216,7 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 				ctx,
 			)
 			if err != nil {
-				errMsg := err.Error()
-
-				if strings.Contains(errMsg, "duplicate signer") ||
-					strings.Contains(errMsg, "entry already published") ||
-					strings.Contains(errMsg, "entry already being published") ||
-					strings.Contains(errMsg, "signature algorithm mismatch") {
-					return nil, http.StatusConflict, err
-				}
-
-				return nil, http.StatusForbidden, err
+				return nil, statusCodeForStagingError(err, http.StatusForbidden), err
 			}
 
 			rspBytes, err := l.makeAppendedResponse(contentHash, referencedLeaf, newLeafIndex, totalSigners)
@@ -1215,18 +1227,9 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 			return rspBytes, http.StatusOK, nil
 		}
 
-		_, _, err := l.stageSubmission(contentHash, signedEntry, wbbEntry)
+		count, _, err := l.stageSubmission(contentHash, signedEntry, wbbEntry)
 		if err != nil {
-			errMsg := err.Error()
-
-			if strings.Contains(errMsg, "signature algorithm mismatch") ||
-				strings.Contains(errMsg, "duplicate signer") ||
-				strings.Contains(errMsg, "entry already published") ||
-				strings.Contains(errMsg, "entry already being published") {
-				return nil, http.StatusConflict, err
-			}
-
-			return nil, http.StatusForbidden, err
+			return nil, statusCodeForStagingError(err, http.StatusForbidden), err
 		}
 
 		count, thresholdMet, err := l.checkThreshold(contentHash)
@@ -1277,14 +1280,7 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 		// Start the grace period, or reuse the already active one.
 		gracePeriodEndAt, err := l.startGracePeriod(contentHash)
 		if err != nil {
-			errMsg := err.Error()
-
-			if strings.Contains(errMsg, "entry already being published") ||
-				strings.Contains(errMsg, "entry already published") {
-				return nil, http.StatusConflict, err
-			}
-
-			return nil, http.StatusInternalServerError, err
+			return nil, statusCodeForStagingError(err, http.StatusInternalServerError), err
 		}
 
 		// If the grace period has already expired, finalize now.
@@ -1293,14 +1289,7 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 		if time.Now().UnixMilli() >= gracePeriodEndAt {
 			leafIndex, err := l.finalizeEntry(contentHash, ctx)
 			if err != nil {
-				errMsg := err.Error()
-
-				if strings.Contains(errMsg, "entry already being published") ||
-					strings.Contains(errMsg, "entry already published") {
-					return nil, http.StatusConflict, err
-				}
-
-				return nil, http.StatusInternalServerError, err
+				return nil, statusCodeForStagingError(err, http.StatusInternalServerError), err
 			}
 
 			rspBytes, err := l.makePublishedResponse(contentHash, leafIndex, currentCount, wbbEntry.Threshold)

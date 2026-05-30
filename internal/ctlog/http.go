@@ -14,6 +14,7 @@ import (
 	"math/rand"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -263,22 +264,87 @@ func stagedSigners(staged *StagingEntry) []string {
 }
 
 func (l *Log) stageSubmission(contentHash [32]byte, signedEntry SignedEntry, wbbEntry WBBEntry) (currentCount int, isNew bool, err error) {
-	// Every staged submission is still a signed submission from one entity.
-	// Before counting it toward the threshold, verify:
-	// - entity_id is present;
-	// - signature is present;
-	// - signer role matches the WBB role;
-	// - Ed25519 signature is valid.
-	if err := l.verifySingleWBBEntry(signedEntry, wbbEntry); err != nil {
-		return 0, false, err
+	// A staged submission must come from exactly one entity.
+	if signedEntry.EntityID == "" {
+		return 0, false, fmtErrorf("missing entity_id field")
 	}
 
-	// block the staging map
+	// Detect which signature algorithm this submission is using.
+	//
+	// Ed25519 staging uses:
+	//   signedEntry.Signature
+	//
+	// BLS staging uses:
+	//   signedEntry.BLSSignature
+	//
+	// A submission must not contain both, and must not contain neither.
+	hasEd25519Signature := len(signedEntry.Signature) > 0
+	hasBLSSignature := len(signedEntry.BLSSignature) > 0
+
+	if hasEd25519Signature == hasBLSSignature {
+		return 0, false, fmtErrorf("submission must contain exactly one signature type")
+	}
+
+	algorithm := "ed25519"
+	if hasBLSSignature {
+		algorithm = "bls"
+	}
+
+	// Verify the single submission before counting it toward the threshold.
+	switch algorithm {
+	case "ed25519":
+		if err := l.verifySingleWBBEntry(signedEntry, wbbEntry); err != nil {
+			return 0, false, err
+		}
+
+	case "bls":
+		// For BLS staging, we still need to enforce that the entity role
+		// matches the WBB role.
+		entityRole, err := roleFromEntityID(signedEntry.EntityID)
+		if err != nil {
+			return 0, false, fmtErrorf("invalid entity ID: %w", err)
+		}
+
+		if entityRole != wbbEntry.Role {
+			return 0, false, fmtErrorf(
+				"entity %s cannot write as role %s",
+				signedEntry.EntityID,
+				wbbEntry.Role,
+			)
+		}
+
+		blsPubKey, exists := l.entityBLSKeys[signedEntry.EntityID]
+		if !exists {
+			return 0, false, fmtErrorf("unknown BLS entity: %s", signedEntry.EntityID)
+		}
+
+		msgInput := make([]byte, 0, len(signedEntry.Data)+len(signedEntry.EntityID)+20)
+		msgInput = append(msgInput, signedEntry.Data...)
+		msgInput = append(msgInput, signedEntry.EntityID...)
+		msgInput = strconv.AppendInt(msgInput, signedEntry.Timestamp, 10)
+
+		msg := sha256.Sum256(msgInput)
+
+		ok, err := my_crypto.VerifyAggregateBytes(
+			[][]byte{blsPubKey},
+			msg[:],
+			signedEntry.BLSSignature,
+		)
+		if err != nil {
+			return 0, false, fmtErrorf("failed to verify BLS signature from %s: %w", signedEntry.EntityID, err)
+		}
+		if !ok {
+			return 0, false, fmtErrorf("invalid BLS signature from %s", signedEntry.EntityID)
+		}
+
+	default:
+		return 0, false, fmtErrorf("unsupported signature algorithm: %s", algorithm)
+	}
+
 	l.stagingMu.Lock()
 	defer l.stagingMu.Unlock()
 
 	staged, ok := l.staging[contentHash]
-	// if an entry does not exixt already, create it!
 	if !ok {
 		staged = &StagingEntry{
 			WBBData:   string(signedEntry.Data),
@@ -288,7 +354,11 @@ func (l *Log) stageSubmission(contentHash [32]byte, signedEntry SignedEntry, wbb
 			Threshold: wbbEntry.Threshold,
 			Content:   wbbEntry.Content,
 
-			// non si conta due volte lo stesso entityID
+			// The signature algorithm is fixed by the first submission.
+			// Later submissions for the same content must use the same one.
+			SigAlgorithm: algorithm,
+
+			// Do not count the same entity twice.
 			Submissions: make(map[string]*StagingSubmission),
 
 			FirstSubmissionAt: signedEntry.Timestamp,
@@ -296,28 +366,57 @@ func (l *Log) stageSubmission(contentHash [32]byte, signedEntry SignedEntry, wbb
 		}
 
 		l.staging[contentHash] = staged
-		isNew = true //new entry created
+		isNew = true
 	}
 
-	// Security check: once this entry has already been published, this
-	// function must not start counting a new threshold round for the same data.
+	// Once this entry has already been published, this function must not
+	// start counting a new threshold round for the same data.
 	if staged.IsPublished {
 		return len(staged.Submissions), false, fmtErrorf("entry already published")
 	}
 
-	// Security check: the same signer must not be counted twice.
-	// Without this check, one entity could satisfy a threshold by submitting
-	// multiple times for the same content.
-	// for example a 3 threshold cannot be satisfied by TT-1, TT-1, TT-2!
+	// All submissions for the same staged entry must use the same algorithm.
+	// This prevents mixing Ed25519 and BLS signatures for the same content.
+	if staged.SigAlgorithm != algorithm {
+		return len(staged.Submissions), false, fmtErrorf(
+			"signature algorithm mismatch: staged entry uses %s, got %s",
+			staged.SigAlgorithm,
+			algorithm,
+		)
+	}
+
+	// The same signer must not be counted twice.
 	if _, exists := staged.Submissions[signedEntry.EntityID]; exists {
 		return len(staged.Submissions), false, fmtErrorf("duplicate signer: %s", signedEntry.EntityID)
 	}
 
-	// Only after verification and duplicate checks, add the submission.
+	// Add the verified submission.
 	staged.Submissions[signedEntry.EntityID] = &StagingSubmission{
-		EntityID:  signedEntry.EntityID,
-		Timestamp: signedEntry.Timestamp,
-		Signature: signedEntry.Signature,
+		EntityID:     signedEntry.EntityID,
+		Timestamp:    signedEntry.Timestamp,
+		Signature:    signedEntry.Signature,
+		BLSSignature: signedEntry.BLSSignature,
+	}
+
+	// Update the running BLS aggregate immediately.
+	//
+	// For Ed25519 we keep individual signatures, because standard Ed25519
+	// signatures are not aggregated here.
+	if algorithm == "bls" {
+		if len(staged.RunningBLSAggregate) == 0 {
+			staged.RunningBLSAggregate = append([]byte(nil), signedEntry.BLSSignature...)
+		} else {
+			aggregate, err := my_crypto.AggregateSignaturesBytes([][]byte{
+				staged.RunningBLSAggregate,
+				signedEntry.BLSSignature,
+			})
+			if err != nil {
+				delete(staged.Submissions, signedEntry.EntityID)
+				return len(staged.Submissions), false, fmtErrorf("failed to update BLS aggregate: %w", err)
+			}
+
+			staged.RunningBLSAggregate = aggregate
+		}
 	}
 
 	if signedEntry.Timestamp < staged.FirstSubmissionAt {
@@ -774,6 +873,10 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 
 		_, _, err := l.stageSubmission(contentHash, signedEntry, wbbEntry)
 		if err != nil {
+			if strings.Contains(err.Error(), "signature algorithm mismatch") {
+				return nil, http.StatusConflict, err
+			}
+
 			return nil, http.StatusForbidden, err
 		}
 

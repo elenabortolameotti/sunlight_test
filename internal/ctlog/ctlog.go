@@ -62,13 +62,13 @@ type Log struct {
 // StagingEntry tracks partial signatures for a WBB entry until the required
 // threshold is reached.
 type StagingEntry struct {
-	WBBData   string
-	Phase     Phase
-	Role      Role
-	EntryType EntryType
-	Threshold int
-	Content   string
-
+	WBBData      string
+	Phase        Phase
+	Role         Role
+	EntryType    EntryType
+	Threshold    int
+	Content      string
+	SigAlgorithm string
 	// Submissions maps each signer entity ID to its partial submission.
 	// This also prevents the same entity from being counted twice.
 	Submissions map[string]*StagingSubmission

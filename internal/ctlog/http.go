@@ -123,6 +123,8 @@ func (l *Log) submit(rw http.ResponseWriter, r *http.Request) {
 	}
 }
 
+const wbbGracePeriod = 10 * time.Second
+
 // What the log does:
 // pretendo data e timestamp
 //parso la WBB entry
@@ -442,6 +444,121 @@ func (l *Log) checkThreshold(contentHash [32]byte) (count int, thresholdMet bool
 	thresholdMet = count >= staged.Threshold
 
 	return count, thresholdMet, nil
+}
+
+//1. prende il lock sulla staging map
+//2. recupera la staging entry
+//3. se è già pubblicata, ritorna errore
+//4. se la grace period è già partita, ritorna la deadline già esistente
+//5. se non è ancora partita:
+//   - imposta IsGracePeriodStarted = true
+//   - imposta GracePeriodEndAt = now + 10 secondi
+//6. rilascia il lock
+//7. avvia un timer background
+//8. quando il timer scade, chiama finalizeEntry()
+
+func (l *Log) startGracePeriod(contentHash [32]byte) (endsAt int64, err error) {
+	l.stagingMu.Lock()
+
+	staged, ok := l.staging[contentHash]
+	if !ok {
+		l.stagingMu.Unlock()
+		return 0, fmtErrorf("staging entry not found")
+	}
+
+	// If the entry has already been published, there is no grace period to start.
+	if staged.IsPublished {
+		leafIndex := staged.LeafIndex
+		l.stagingMu.Unlock()
+
+		if leafIndex < 0 {
+			return 0, fmtErrorf("entry already being published")
+		}
+
+		return 0, fmtErrorf("entry already published")
+	}
+
+	// If the grace period was already started by another request,
+	// just return the existing deadline.
+	if staged.IsGracePeriodStarted {
+		endsAt := staged.GracePeriodEndAt
+		l.stagingMu.Unlock()
+		return endsAt, nil
+	}
+
+	// Start the grace period.
+	//
+	// We use Unix milliseconds because the rest of the SignedEntry timestamps
+	// are also represented as Unix milliseconds.
+	endsAt = time.Now().Add(wbbGracePeriod).UnixMilli()
+
+	staged.IsGracePeriodStarted = true
+	staged.GracePeriodEndAt = endsAt
+
+	l.stagingMu.Unlock()
+
+	// Background finalization.
+	//
+	// When the grace period expires, the server tries to finalize the entry.
+	// finalizeEntry() is race-safe: if the entry was already published earlier,
+	// it will not publish it twice.
+	time.AfterFunc(wbbGracePeriod, func() {
+		if _, err := l.finalizeEntry(contentHash, context.Background()); err != nil {
+			l.c.Log.WarnContext(
+				context.Background(),
+				"failed to finalize WBB entry after grace period",
+				"err", err,
+			)
+		}
+	})
+
+	return endsAt, nil
+}
+
+func (l *Log) checkAllSignersPresent(contentHash [32]byte) (count int, totalExpected int, allPresent bool, err error) {
+	l.stagingMu.Lock()
+	defer l.stagingMu.Unlock()
+
+	staged, ok := l.staging[contentHash]
+	if !ok {
+		return 0, 0, false, fmtErrorf("staging entry not found")
+	}
+
+	count = len(staged.Submissions)
+
+	for entityID := range l.entityKeys {
+		entityRole, err := roleFromEntityID(entityID)
+		if err != nil {
+			continue
+		}
+
+		if entityRole == staged.Role {
+			totalExpected++
+		}
+	}
+
+	// BLS-only entities may exist only in entityBLSKeys. Count them too,
+	// but avoid double-counting entities already present in entityKeys.
+	for entityID := range l.entityBLSKeys {
+		if _, alreadyCounted := l.entityKeys[entityID]; alreadyCounted {
+			continue
+		}
+
+		entityRole, err := roleFromEntityID(entityID)
+		if err != nil {
+			continue
+		}
+
+		if entityRole == staged.Role {
+			totalExpected++
+		}
+	}
+
+	if totalExpected == 0 {
+		return count, totalExpected, false, fmtErrorf("no expected signers found for role %s", staged.Role)
+	}
+
+	return count, totalExpected, count >= totalExpected, nil
 }
 
 func (l *Log) finalizeEntry(contentHash [32]byte, ctx context.Context) (leafIndex int64, err error) {
@@ -822,6 +939,44 @@ func (l *Log) makePublishedResponse(contentHash [32]byte, leafIndex int64, curre
 	return json.Marshal(rsp)
 }
 
+type stagingGracePeriodResponse struct {
+	Status           string   `json:"status"`
+	ContentHash      string   `json:"content_hash"`
+	CurrentSigners   int      `json:"current_signers"`
+	RequiredSigners  int      `json:"required_signers"`
+	TotalExpected    int      `json:"total_expected,omitempty"`
+	Signers          []string `json:"signers"`
+	GracePeriodEndAt int64    `json:"grace_period_end_at"`
+	Message          string   `json:"message"`
+}
+
+func (l *Log) makeGracePeriodResponse(contentHash [32]byte, currentCount int, requiredCount int, totalExpected int, gracePeriodEndAt int64) ([]byte, error) {
+	l.stagingMu.Lock()
+
+	staged, ok := l.staging[contentHash]
+	if !ok {
+		l.stagingMu.Unlock()
+		return nil, fmtErrorf("staging entry not found")
+	}
+
+	signers := stagedSigners(staged)
+
+	l.stagingMu.Unlock()
+
+	rsp := stagingGracePeriodResponse{
+		Status:           "grace_period",
+		ContentHash:      hex.EncodeToString(contentHash[:]),
+		CurrentSigners:   currentCount,
+		RequiredSigners:  requiredCount,
+		TotalExpected:    totalExpected,
+		Signers:          signers,
+		GracePeriodEndAt: gracePeriodEndAt,
+		Message:          "threshold reached, grace period active",
+	}
+
+	return json.Marshal(rsp)
+}
+
 type stagingAppendedResponse struct {
 	Status           string            `json:"status"`
 	ContentHash      string            `json:"content_hash"`
@@ -991,7 +1146,40 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 
 			return rspBytes, http.StatusAccepted, nil
 		}
-		leafIndex, err := l.finalizeEntry(contentHash, ctx)
+
+		// At this point the threshold has been reached.
+		// Do not publish immediately: start or continue the grace period first.
+		currentCount, totalExpected, allSignersPresent, err := l.checkAllSignersPresent(contentHash)
+		if err != nil {
+			return nil, http.StatusInternalServerError, err
+		}
+
+		// If all expected signers are already present, publish immediately.
+		// This is the "early publication" path.
+		if allSignersPresent {
+			leafIndex, err := l.finalizeEntry(contentHash, ctx)
+			if err != nil {
+				errMsg := err.Error()
+
+				if strings.Contains(errMsg, "entry already being published") ||
+					strings.Contains(errMsg, "entry already published") {
+					return nil, http.StatusConflict, err
+				}
+
+				return nil, http.StatusInternalServerError, err
+			}
+
+			rspBytes, err := l.makePublishedResponse(contentHash, leafIndex, currentCount, wbbEntry.Threshold)
+			if err != nil {
+				return nil, http.StatusInternalServerError, fmtErrorf("failed to encode published response: %w", err)
+			}
+
+			return rspBytes, http.StatusOK, nil
+		}
+
+		// Threshold is met, but not all expected signers are present.
+		// Start the grace period, or reuse the already active one.
+		gracePeriodEndAt, err := l.startGracePeriod(contentHash)
 		if err != nil {
 			errMsg := err.Error()
 
@@ -1003,12 +1191,43 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 			return nil, http.StatusInternalServerError, err
 		}
 
-		rspBytes, err := l.makePublishedResponse(contentHash, leafIndex, count, wbbEntry.Threshold)
-		if err != nil {
-			return nil, http.StatusInternalServerError, fmtErrorf("failed to encode published response: %w", err)
+		// If the grace period has already expired, finalize now.
+		// This covers the case where the timer did not run yet, or a new request
+		// arrives after the deadline.
+		if time.Now().UnixMilli() >= gracePeriodEndAt {
+			leafIndex, err := l.finalizeEntry(contentHash, ctx)
+			if err != nil {
+				errMsg := err.Error()
+
+				if strings.Contains(errMsg, "entry already being published") ||
+					strings.Contains(errMsg, "entry already published") {
+					return nil, http.StatusConflict, err
+				}
+
+				return nil, http.StatusInternalServerError, err
+			}
+
+			rspBytes, err := l.makePublishedResponse(contentHash, leafIndex, currentCount, wbbEntry.Threshold)
+			if err != nil {
+				return nil, http.StatusInternalServerError, fmtErrorf("failed to encode published response: %w", err)
+			}
+
+			return rspBytes, http.StatusOK, nil
 		}
 
-		return rspBytes, http.StatusOK, nil
+		// Grace period is active: return 202 Accepted.
+		rspBytes, err := l.makeGracePeriodResponse(
+			contentHash,
+			currentCount,
+			wbbEntry.Threshold,
+			totalExpected,
+			gracePeriodEndAt,
+		)
+		if err != nil {
+			return nil, http.StatusInternalServerError, fmtErrorf("failed to encode grace period response: %w", err)
+		}
+
+		return rspBytes, http.StatusAccepted, nil
 	}
 
 	entryBytes, err := json.Marshal(signedEntry)

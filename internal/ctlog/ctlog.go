@@ -82,6 +82,13 @@ type StagingEntry struct {
 	FirstSubmissionAt int64
 	LastSubmissionAt  int64
 
+	// Grace period state.
+	// Once the threshold is reached, the entry is not immediately published.
+	// Instead, the server waits until GracePeriodEndAt so that additional
+	// valid signers can still be included before finalization.
+	GracePeriodEndAt     int64
+	IsGracePeriodStarted bool
+
 	IsPublished bool
 	LeafIndex   int64
 }

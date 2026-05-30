@@ -594,8 +594,60 @@ func (l *Log) appendToPublishedEntry(contentHash [32]byte, signedEntry SignedEnt
 
 	// Even if the entry is already published, the late arrival must still be
 	// a valid signature from an entity with the correct role.
-	if err := l.verifySingleWBBEntry(signedEntry, wbbEntry); err != nil {
-		return 0, 0, err
+	switch staged.SigAlgorithm {
+	case "ed25519":
+		if err := l.verifySingleWBBEntry(signedEntry, wbbEntry); err != nil {
+			return 0, 0, err
+		}
+
+	case "bls":
+		if len(signedEntry.BLSSignature) == 0 {
+			return 0, 0, fmtErrorf("staging entry uses BLS, expected bls_signature")
+		}
+
+		if len(signedEntry.Signature) > 0 {
+			return 0, 0, fmtErrorf("staging entry uses BLS, got ed25519 signature")
+		}
+
+		entityRole, err := roleFromEntityID(signedEntry.EntityID)
+		if err != nil {
+			return 0, 0, fmtErrorf("invalid entity ID: %w", err)
+		}
+
+		if entityRole != staged.Role {
+			return 0, 0, fmtErrorf(
+				"entity %s cannot write as role %s",
+				signedEntry.EntityID,
+				staged.Role,
+			)
+		}
+
+		blsPubKey, exists := l.entityBLSKeys[signedEntry.EntityID]
+		if !exists {
+			return 0, 0, fmtErrorf("unknown BLS entity: %s", signedEntry.EntityID)
+		}
+
+		msgInput := make([]byte, 0, len(signedEntry.Data)+len(signedEntry.EntityID)+20)
+		msgInput = append(msgInput, signedEntry.Data...)
+		msgInput = append(msgInput, signedEntry.EntityID...)
+		msgInput = strconv.AppendInt(msgInput, signedEntry.Timestamp, 10)
+
+		msg := sha256.Sum256(msgInput)
+
+		ok, err := my_crypto.VerifyAggregateBytes(
+			[][]byte{blsPubKey},
+			msg[:],
+			signedEntry.BLSSignature,
+		)
+		if err != nil {
+			return 0, 0, fmtErrorf("failed to verify BLS signature from %s: %w", signedEntry.EntityID, err)
+		}
+		if !ok {
+			return 0, 0, fmtErrorf("invalid BLS signature from %s", signedEntry.EntityID)
+		}
+
+	default:
+		return 0, 0, fmtErrorf("unsupported staging signature algorithm: %s", staged.SigAlgorithm)
 	}
 
 	l.stagingMu.Lock()
@@ -615,9 +667,27 @@ func (l *Log) appendToPublishedEntry(contentHash [32]byte, signedEntry SignedEnt
 	}
 
 	staged.Submissions[entityID] = &StagingSubmission{
-		EntityID:  entityID,
-		Timestamp: signedEntry.Timestamp,
-		Signature: signedEntry.Signature,
+		EntityID:     entityID,
+		Timestamp:    signedEntry.Timestamp,
+		Signature:    signedEntry.Signature,
+		BLSSignature: signedEntry.BLSSignature,
+	}
+
+	if staged.SigAlgorithm == "bls" {
+		if len(staged.RunningBLSAggregate) == 0 {
+			staged.RunningBLSAggregate = append([]byte(nil), signedEntry.BLSSignature...)
+		} else {
+			aggregate, err := my_crypto.AggregateSignaturesBytes([][]byte{
+				staged.RunningBLSAggregate,
+				signedEntry.BLSSignature,
+			})
+			if err != nil {
+				delete(staged.Submissions, entityID)
+				return 0, 0, fmtErrorf("failed to update BLS aggregate for late arrival: %w", err)
+			}
+
+			staged.RunningBLSAggregate = aggregate
+		}
 	}
 
 	if signedEntry.Timestamp > staged.LastSubmissionAt {

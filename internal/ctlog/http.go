@@ -373,10 +373,21 @@ func (l *Log) finalizeEntry(contentHash [32]byte, ctx context.Context) (leafInde
 
 	entityIDs := stagedSigners(staged)
 
+	signerTimestamps := make([]SignerTimestamp, 0, len(entityIDs))
+	for _, entityID := range entityIDs {
+		submission := staged.Submissions[entityID]
+
+		signerTimestamps = append(signerTimestamps, SignerTimestamp{
+			EntityID:  entityID,
+			Timestamp: submission.Timestamp,
+		})
+	}
+
 	finalEntry := SignedEntry{
-		Data:      []byte(staged.WBBData),
-		Timestamp: staged.FirstSubmissionAt,
-		EntityIDs: entityIDs,
+		Data:             []byte(staged.WBBData),
+		Timestamp:        staged.LastSubmissionAt,
+		EntityIDs:        entityIDs,
+		SignerTimestamps: signerTimestamps,
 	}
 
 	if len(staged.RunningBLSAggregate) > 0 {
@@ -555,17 +566,20 @@ func (l *Log) makePendingResponse(contentHash [32]byte, currentCount int, requir
 }
 
 type stagingPublishedResponse struct {
-	Status             string   `json:"status"`
-	ContentHash        string   `json:"content_hash"`
-	LeafIndex          int64    `json:"leaf_index"`
-	CurrentSigners     int      `json:"current_signers"`
-	RequiredSigners    int      `json:"required_signers"`
-	Signers            []string `json:"signers"`
-	Message            string   `json:"message"`
-	Algorithm          string            `json:"algorithm,omitempty"`
-	Signatures         [][]byte          `json:"signatures,omitempty"`
-	AggregateSignature []byte            `json:"aggregate_signature,omitempty"`
-	SignerTimestamps   []SignerTimestamp `json:"signer_timestamps,omitempty"`
+	Status          string   `json:"status"`
+	ContentHash     string   `json:"content_hash"`
+	LeafIndex       int64    `json:"leaf_index"`
+	Timestamp       int64    `json:"timestamp"`
+	CurrentSigners  int      `json:"current_signers"`
+	RequiredSigners int      `json:"required_signers"`
+	Signers         []string `json:"signers"`
+	Message         string   `json:"message"`
+
+	Algorithm          string   `json:"algorithm,omitempty"`
+	Signatures         [][]byte `json:"signatures,omitempty"`
+	AggregateSignature []byte   `json:"aggregate_signature,omitempty"`
+
+	SignerTimestamps []SignerTimestamp `json:"signer_timestamps,omitempty"`
 }
 
 func (l *Log) makePublishedResponse(contentHash [32]byte, leafIndex int64, currentCount int, requiredCount int) ([]byte, error) {
@@ -577,6 +591,17 @@ func (l *Log) makePublishedResponse(contentHash [32]byte, leafIndex int64, curre
 	}
 
 	signers := stagedSigners(staged)
+	publishedTimestamp := staged.LastSubmissionAt
+
+	signerTimestamps := make([]SignerTimestamp, 0, len(signers))
+	for _, entityID := range signers {
+		submission := staged.Submissions[entityID]
+
+		signerTimestamps = append(signerTimestamps, SignerTimestamp{
+			EntityID:  entityID,
+			Timestamp: submission.Timestamp,
+		})
+	}
 
 	algorithm := "ed25519"
 	var signatures [][]byte
@@ -594,19 +619,11 @@ func (l *Log) makePublishedResponse(contentHash [32]byte, leafIndex int64, curre
 
 	l.stagingMu.Unlock()
 
-	// Collect all individual submission timestamps for audit
-	signerTimestamps := make([]SignerTimestamp, 0, len(signers))
-	for _, entityID := range signers {
-		signerTimestamps = append(signerTimestamps, SignerTimestamp{
-			EntityID:  entityID,
-			Timestamp: staged.Submissions[entityID].Timestamp,
-		})
-	}
-
 	rsp := stagingPublishedResponse{
 		Status:          "published",
 		ContentHash:     hex.EncodeToString(contentHash[:]),
 		LeafIndex:       leafIndex,
+		Timestamp:       publishedTimestamp,
 		CurrentSigners:  currentCount,
 		RequiredSigners: requiredCount,
 		Signers:         signers,
@@ -615,9 +632,9 @@ func (l *Log) makePublishedResponse(contentHash [32]byte, leafIndex int64, curre
 		Algorithm:          algorithm,
 		Signatures:         signatures,
 		AggregateSignature: aggregateSignature,
-		SignerTimestamps:   signerTimestamps,
-	}
 
+		SignerTimestamps: signerTimestamps,
+	}
 	return json.Marshal(rsp)
 }
 

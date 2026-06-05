@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/tls"
@@ -86,6 +87,10 @@ type LogConfig struct {
 	S3Endpoint       string
 	S3KeyPrefix      string
 	LocalDirectory   string
+	// EntityKeys maps entity IDs to base64-encoded Ed25519 public keys.
+	EntityKeys map[string]string `yaml:"entity_keys,omitempty"`
+	// EntityBLSKeys maps entity IDs to base64-encoded BLS public keys.
+	EntityBLSKeys map[string]string `yaml:"entity_bls_keys,omitempty"`
 }
 
 type logInfo struct {
@@ -308,14 +313,37 @@ func main() {
 				"name", lc.Name, "submissionPrefix", lc.SubmissionPrefix)
 		}
 
+		entityKeys := make(map[string]ed25519.PublicKey)
+		for id, keyB64 := range lc.EntityKeys {
+			keyBytes, err := base64.StdEncoding.DecodeString(keyB64)
+			if err != nil {
+				fatalError(logger, "failed to decode entity key", "entity", id, "err", err)
+			}
+			if len(keyBytes) != ed25519.PublicKeySize {
+				fatalError(logger, "invalid entity key length", "entity", id, "len", len(keyBytes))
+			}
+			entityKeys[id] = ed25519.PublicKey(keyBytes)
+		}
+
+		entityBLSKeys := make(map[string][]byte)
+		for id, keyB64 := range lc.EntityBLSKeys {
+			keyBytes, err := base64.StdEncoding.DecodeString(keyB64)
+			if err != nil {
+				fatalError(logger, "failed to decode BLS entity key", "entity", id, "err", err)
+			}
+			entityBLSKeys[id] = keyBytes
+		}
+
 		cc := &ctlog.Config{
-			Name:     prefix.Host + prefix.Path,
-			Key:      k,
-			Cache:    lc.Cache,
-			PoolSize: lc.PoolSize,
-			Backend:  b,
-			Lock:     db,
-			Log:      logger,
+			Name:          prefix.Host + prefix.Path,
+			Key:           k,
+			Cache:         lc.Cache,
+			PoolSize:      lc.PoolSize,
+			Backend:       b,
+			Lock:          db,
+			Log:           logger,
+			EntityKeys:    entityKeys,
+			EntityBLSKeys: entityBLSKeys,
 		}
 
 		if time.Now().Format(time.DateOnly) == lc.Inception {

@@ -690,6 +690,11 @@ func (l *Log) finalizeEntry(contentHash [32]byte, ctx context.Context) (leafInde
 	l.stagingMu.Lock()
 	if staged, ok := l.staging[contentHash]; ok {
 		staged.LeafIndex = seq.LeafIndex
+		// Preserve the original leaf index so late arrivals always reference
+		// the first published leaf, not a subsequent late-arrival leaf.
+		if staged.OriginalLeafIndex == 0 {
+			staged.OriginalLeafIndex = seq.LeafIndex
+		}
 	}
 	l.stagingMu.Unlock()
 
@@ -846,7 +851,13 @@ func (l *Log) appendToPublishedEntry(
 		return leafIndex, leafIndex, count, fmtErrorf("duplicate signer: %s", entityID)
 	}
 
-	referencedLeaf = staged.LeafIndex
+	// Use OriginalLeafIndex so every late arrival references the first
+	// published leaf, not a previous late-arrival leaf.
+	if staged.OriginalLeafIndex != 0 {
+		referencedLeaf = staged.OriginalLeafIndex
+	} else {
+		referencedLeaf = staged.LeafIndex
+	}
 	oldLastSubmissionAt := staged.LastSubmissionAt
 	oldBLSAggregate := append([]byte(nil), staged.RunningBLSAggregate...)
 

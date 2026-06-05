@@ -1,0 +1,17 @@
+listen:
+  - ":8080"
+
+checkpoints: ./checkpoints.db
+
+logs:
+  - shortname: "test"
+    inception: "2026-06-05"
+    secret: ./seed.bin
+    localdirectory: ./logdata
+    cache: ./cache.db
+    submissionprefix: "https://localhost/ctlog"
+    monitoringprefix: "https://localhost/ctlog"
+    entity_keys:
+      RT-1: "0P2+PtAf7TZsqFWbbPXUzCoqiPOSBsmV/z26n6kM0vY="
+      RT-2: "0s0voGVTtTrgdSzBQl6oVI0T1bz3RPW6NHxS7efSWFQ="
+      RT-3: "+8A1FqN92KBYh/IP5O/8NH2QfOvz/Z4O2A6BgnWALMY="

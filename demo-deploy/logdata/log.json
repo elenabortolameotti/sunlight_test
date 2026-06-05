@@ -1,0 +1,15 @@
+{
+    "description": "localhost/ctlog",
+    "friendly_name": "test",
+    "submission_url": "https://localhost/ctlog/",
+    "monitoring_url": "https://localhost/ctlog/",
+    "pool_size": 0,
+    "log_id": "Sz8/857BTovazj2yRJS257/mSYG+wPh0fKThwDujufE=",
+    "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEdWD6YNgQ5Jtfn+JXzm6KADQHqFUq\n1An8HE1mR8MPQ2UywH42WUQctgooDetalhnEIa7RIZ4MhC6eIWHDUc2cPQ==\n-----END PUBLIC KEY-----\n",
+    "public_key_der": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEdWD6YNgQ5Jtfn+JXzm6KADQHqFUq1An8HE1mR8MPQ2UywH42WUQctgooDetalhnEIa7RIZ4MhC6eIWHDUc2cPQ==",
+    "public_key_base64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEdWD6YNgQ5Jtfn+JXzm6KADQHqFUq1An8HE1mR8MPQ2UywH42WUQctgooDetalhnEIa7RIZ4MhC6eIWHDUc2cPQ==",
+    "log_software": {
+        "name": "filippo.io/sunlight",
+        "version": "v0.0.0-20260530090211-90ab0537babd+dirty"
+    }
+}

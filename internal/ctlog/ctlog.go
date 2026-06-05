@@ -91,6 +91,11 @@ type StagingEntry struct {
 
 	IsPublished bool
 	LeafIndex   int64
+
+	// OriginalLeafIndex is the leaf index of the first publication.
+	// Unlike LeafIndex, this is never updated by late arrivals, so every
+	// late-arrival reference entry can point back to the original leaf.
+	OriginalLeafIndex int64
 }
 
 // StagingSubmission stores the signature material provided by one entity.

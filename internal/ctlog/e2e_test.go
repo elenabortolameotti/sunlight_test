@@ -39,7 +39,8 @@ func TestE2ESignedEntrySubmission(t *testing.T) {
 		t.Fatalf("Failed to generate log key: %v", err)
 	}
 
-	// Create test log with entity keys
+	// Create test log with entity keys using WBB-compatible entity IDs.
+	// ER-1 and ER-2 are Election Registrar entities (threshold=1, simple path).
 	tmpDir := t.TempDir()
 	config := &ctlog.Config{
 		Name:    "test.log.example.com",
@@ -49,8 +50,8 @@ func TestE2ESignedEntrySubmission(t *testing.T) {
 		Lock:    NewMemoryLockBackend(t),
 		Log:     slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
 		EntityKeys: map[string]ed25519.PublicKey{
-			"witness-1": witnessPub,
-			"client-a":  clientPub,
+			"ER-1": witnessPub,
+			"ER-2": clientPub,
 		},
 	}
 
@@ -87,10 +88,16 @@ func TestE2ESignedEntrySubmission(t *testing.T) {
 		}
 	}()
 
+	// All test data must be in valid WBB format: phase,role,entry_type,threshold,content
+	// We use ER (Election Registrar) entries with threshold=1 for the simple direct-publication path.
+	validWBBData := func(content string) []byte {
+		return []byte("setup,ER,election_pub_key,1," + content)
+	}
+
 	// Test 1: Submit valid signed entry
 	t.Run("valid signed entry", func(t *testing.T) {
-		data := []byte("hello world")
-		entityID := "witness-1"
+		data := validWBBData("hello_world")
+		entityID := "ER-1"
 		timestamp := time.Now().UnixMilli()
 
 		signedEntry := createSignedEntry(t, data, entityID, timestamp, witnessPriv)
@@ -106,24 +113,24 @@ func TestE2ESignedEntrySubmission(t *testing.T) {
 	// Test 2: Submit unsigned entry (should fail)
 	t.Run("unsigned entry rejected", func(t *testing.T) {
 		unsignedEntry := ctlog.SignedEntry{
-			Data:      []byte("unsigned data"),
-			EntityID:  "witness-1",
+			Data:      validWBBData("unsigned_data"),
+			EntityID:  "ER-1",
 			Timestamp: time.Now().UnixMilli(),
 			// No signature
 		}
 
 		resp := submitEntry(t, server.URL+"/submit", unsignedEntry)
-		// Missing signature returns 400 (bad request), not 401 (unauthorized)
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Errorf("Expected 400 for unsigned entry, got %d", resp.StatusCode)
+		// Missing signature returns 403 (forbidden) from verifySingleWBBEntry
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("Expected 403 for unsigned entry, got %d", resp.StatusCode)
 		}
 		resp.Body.Close()
 	})
 
 	// Test 3: Submit with invalid signature (should fail)
 	t.Run("invalid signature rejected", func(t *testing.T) {
-		data := []byte("tampered data")
-		entityID := "witness-1"
+		data := validWBBData("tampered_data")
+		entityID := "ER-1"
 		timestamp := time.Now().UnixMilli()
 
 		// Create entry but with wrong signature
@@ -131,32 +138,32 @@ func TestE2ESignedEntrySubmission(t *testing.T) {
 		signedEntry.Signature = append(signedEntry.Signature[:len(signedEntry.Signature)-1], byte(0xFF)) // Corrupt signature
 
 		resp := submitEntry(t, server.URL+"/submit", signedEntry)
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Errorf("Expected 401 for invalid signature, got %d", resp.StatusCode)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("Expected 403 for invalid signature, got %d", resp.StatusCode)
 		}
 		resp.Body.Close()
 	})
 
 	// Test 4: Submit with unknown entity (should fail)
 	t.Run("unknown entity rejected", func(t *testing.T) {
-		data := []byte("unknown entity data")
-		entityID := "unknown-entity"
+		data := validWBBData("unknown_entity_data")
+		entityID := "ER-99" // Valid role format but not in entity registry
 		timestamp := time.Now().UnixMilli()
 
 		_, unknownPriv, _ := ed25519.GenerateKey(nil)
 		signedEntry := createSignedEntry(t, data, entityID, timestamp, unknownPriv)
 
 		resp := submitEntry(t, server.URL+"/submit", signedEntry)
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Errorf("Expected 401 for unknown entity, got %d", resp.StatusCode)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("Expected 403 for unknown entity, got %d", resp.StatusCode)
 		}
 		resp.Body.Close()
 	})
 
 	// Test 5: Submit with old timestamp (should fail)
 	t.Run("old timestamp rejected", func(t *testing.T) {
-		data := []byte("old timestamp data")
-		entityID := "witness-1"
+		data := validWBBData("old_timestamp_data")
+		entityID := "ER-1"
 		timestamp := time.Now().Add(-10 * time.Minute).UnixMilli() // 10 minutes ago
 
 		signedEntry := createSignedEntry(t, data, entityID, timestamp, witnessPriv)
@@ -171,8 +178,8 @@ func TestE2ESignedEntrySubmission(t *testing.T) {
 
 	// Test 6: Submit with future timestamp (should fail)
 	t.Run("future timestamp rejected", func(t *testing.T) {
-		data := []byte("future timestamp data")
-		entityID := "witness-1"
+		data := validWBBData("future_timestamp_data")
+		entityID := "ER-1"
 		timestamp := time.Now().Add(10 * time.Minute).UnixMilli() // 10 minutes in future
 
 		signedEntry := createSignedEntry(t, data, entityID, timestamp, witnessPriv)

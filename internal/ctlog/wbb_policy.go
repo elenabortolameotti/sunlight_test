@@ -20,6 +20,7 @@ const (
 	RoleTT Role = "TT"
 	RoleER Role = "ER"
 	RoleBB Role = "BB"
+	RolePM Role = "PM"
 
 	EntryAccPubKey           EntryType = "acc_pub_key"
 	EntryElectionPubKey      EntryType = "election_pub_key"
@@ -35,6 +36,8 @@ const (
 	EntryReEncryptionProof EntryType = "re_encryption_proof"
 	EntryTallyResult       EntryType = "tally_result"
 	EntryTallyProof        EntryType = "tally_proof"
+
+	EntryPhaseTransition EntryType = "phase_transition"
 )
 
 const (
@@ -127,6 +130,12 @@ func CheckWBBWritePolicy(s string) (bool, error) {
 	}
 
 	if phase == PhaseTallying && role == RoleTT && entryType == EntryTallyProof && threshold >= ThresholdTT {
+		return true, nil
+	}
+
+	// Phase manager can write phase_transition entries in any phase.
+	// The transition validation happens separately in submitEntry.
+	if role == RolePM && entryType == EntryPhaseTransition && threshold >= ThresholdOne {
 		return true, nil
 	}
 

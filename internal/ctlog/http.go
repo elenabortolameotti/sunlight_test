@@ -59,6 +59,9 @@ type SignerTimestamp struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
+// PhaseTransition is a signed message from the phase_manager that authorizes
+// advancing the log's current phase. The phase can only move forward through
+// setup → voting → tallying and never skip a step.
 // IsTimestampValid checks if the timestamp is within acceptable window
 func (e *SignedEntry) IsTimestampValid() bool {
 	// Allow ±5 minutes from current time
@@ -121,6 +124,46 @@ func (l *Log) submit(rw http.ResponseWriter, r *http.Request) {
 		l.c.Log.DebugContext(r.Context(), "failed to write submit response", "err", err)
 		return
 	}
+}
+
+// isValidPhaseTransition returns true only for the allowed sequential
+// advancements: setup → voting → tallying.
+func isValidPhaseTransition(from, to Phase) bool {
+	switch from {
+	case PhaseSetup:
+		return to == PhaseVoting
+	case PhaseVoting:
+		return to == PhaseTallying
+	case PhaseTallying:
+		return false // terminal state
+	default:
+		return false
+	}
+}
+
+// applyPhaseTransitionIfNeeded updates currentPhase if the published entry
+// is a valid phase_transition from the phase_manager. This must be called
+// after the entry is confirmed published in the log.
+func (l *Log) applyPhaseTransitionIfNeeded(wbbEntry WBBEntry) {
+	// Only process phase_manager entries
+	if wbbEntry.Role != RolePM || wbbEntry.EntryType != EntryPhaseTransition {
+		return
+	}
+	// Only process if phase_manager is configured
+	if len(l.c.PhaseManagerKey) == 0 {
+		return
+	}
+	// Extract next phase from content
+	nextPhase := Phase(wbbEntry.Content)
+	l.phaseMu.Lock()
+	defer l.phaseMu.Unlock()
+	// Only apply if the transition is still valid
+	if !isValidPhaseTransition(l.currentPhase, nextPhase) {
+		return
+	}
+	prevPhase := l.currentPhase
+	l.currentPhase = nextPhase
+	l.c.Log.Info("phase transition via logged entry", "from", prevPhase, "to", nextPhase)
 }
 
 const wbbGracePeriod = 10 * time.Second
@@ -698,6 +741,11 @@ func (l *Log) finalizeEntry(contentHash [32]byte, ctx context.Context) (leafInde
 	}
 	l.stagingMu.Unlock()
 
+	// Apply phase transition if this entry is a phase_manager phase_transition
+	if wbbEntry, err := ParseWBBEntry(staged.WBBData); err == nil {
+		l.applyPhaseTransitionIfNeeded(wbbEntry)
+	}
+
 	return seq.LeafIndex, nil
 }
 
@@ -1210,6 +1258,38 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 		return nil, http.StatusForbidden, fmtErrorf("write not authorized")
 	}
 
+	// If a phase_manager is configured, the entry's phase must match the
+	// server's current phase. The only way the phase advances is through a
+	// logged phase_transition entry from the phase_manager. When no phase_manager
+	// is configured, phase enforcement is skipped for backward compatibility.
+	l.phaseMu.RLock()
+	currentPhase := l.currentPhase
+	l.phaseMu.RUnlock()
+	if len(l.c.PhaseManagerKey) > 0 && wbbEntry.Phase != currentPhase {
+		return nil, http.StatusForbidden, fmtErrorf("entry phase %q does not match current server phase %q", wbbEntry.Phase, currentPhase)
+	}
+
+	// If this is a phase_manager entry, validate the transition and the
+	// signer's authority before logging.
+	if wbbEntry.Role == RolePM && wbbEntry.EntryType == EntryPhaseTransition {
+		if len(l.c.PhaseManagerKey) == 0 {
+			return nil, http.StatusForbidden, fmtErrorf("phase_manager not configured")
+		}
+		// Validate the transition: currentPhase → nextPhase
+		nextPhase := Phase(wbbEntry.Content)
+		if wbbEntry.Phase != currentPhase {
+			return nil, http.StatusForbidden, fmtErrorf("phase transition entry phase %q does not match current server phase %q", wbbEntry.Phase, currentPhase)
+		}
+		if !isValidPhaseTransition(currentPhase, nextPhase) {
+			return nil, http.StatusForbidden, fmtErrorf("invalid phase transition: %q -> %q", currentPhase, nextPhase)
+		}
+		// Verify the signer's key matches the configured phase_manager key
+		pubKey, ok := l.entityKeys[signedEntry.EntityID]
+		if !ok || !bytes.Equal(pubKey, l.c.PhaseManagerKey) {
+			return nil, http.StatusForbidden, fmtErrorf("unauthorized phase_manager")
+		}
+	}
+
 	if wbbEntry.Threshold == 1 {
 		// Threshold-1 entries are verified immediately and then continue
 		// through the normal publication path below.
@@ -1393,6 +1473,9 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 		return nil, http.StatusInternalServerError, fmtErrorf("failed to encode response: %w", err)
 	}
 
+	// Apply phase transition if this is a phase_manager entry
+	l.applyPhaseTransitionIfNeeded(wbbEntry)
+
 	return rspBytes, http.StatusOK, nil
 }
 
@@ -1404,7 +1487,7 @@ func roleFromEntityID(entityID string) (Role, error) {
 
 	role := Role(parts[0])
 	switch role {
-	case RoleRT, RoleER, RoleBB, RoleTT:
+	case RoleRT, RoleER, RoleBB, RoleTT, RolePM:
 		return role, nil
 	default:
 		return "", fmt.Errorf("unknown role %q", parts[0])

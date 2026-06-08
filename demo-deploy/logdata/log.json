@@ -10,6 +10,6 @@
     "public_key_base64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEdWD6YNgQ5Jtfn+JXzm6KADQHqFUq1An8HE1mR8MPQ2UywH42WUQctgooDetalhnEIa7RIZ4MhC6eIWHDUc2cPQ==",
     "log_software": {
         "name": "filippo.io/sunlight",
-        "version": "v0.0.0-20260530090211-90ab0537babd+dirty"
+        "version": "v0.0.0-20260605082602-da930a9e17d3+dirty"
     }
 }

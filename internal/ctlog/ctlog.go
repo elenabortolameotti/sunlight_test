@@ -57,6 +57,11 @@ type Log struct {
 	entityBLSKeys map[string][]byte
 	stagingMu     sync.Mutex
 	staging       map[[32]byte]*StagingEntry
+
+	// phaseMu protects currentPhase. The phase can only advance through a
+	// signed PhaseTransition message from the configured phase_manager.
+	phaseMu       sync.RWMutex
+	currentPhase  Phase
 }
 
 // StagingEntry tracks partial signatures for a WBB entry until the required
@@ -139,7 +144,8 @@ type Config struct {
 	EntityKeys map[string]ed25519.PublicKey // Optional: override hardcoded entity keys
 
 	// Added
-	EntityBLSKeys map[string][]byte
+	EntityBLSKeys    map[string][]byte
+	PhaseManagerKey  ed25519.PublicKey // Optional: external actor that orchestrates phase changes
 }
 
 var ErrLogExists = errors.New("checkpoint already exist, refusing to initialize log")
@@ -344,6 +350,7 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 		entityKeys:     entityKeys,
 		entityBLSKeys:  entityBLSKeys,
 		staging:        make(map[[32]byte]*StagingEntry),
+		currentPhase:   PhaseSetup,
 	}, nil
 }
 

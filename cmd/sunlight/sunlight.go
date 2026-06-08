@@ -91,6 +91,9 @@ type LogConfig struct {
 	EntityKeys map[string]string `yaml:"entity_keys,omitempty"`
 	// EntityBLSKeys maps entity IDs to base64-encoded BLS public keys.
 	EntityBLSKeys map[string]string `yaml:"entity_bls_keys,omitempty"`
+	// PhaseManagerKey is a base64-encoded Ed25519 public key of the external
+	// actor that orchestrates phase changes (setup → voting → tallying).
+	PhaseManagerKey string `yaml:"phase_manager_key,omitempty"`
 }
 
 type logInfo struct {
@@ -334,16 +337,29 @@ func main() {
 			entityBLSKeys[id] = keyBytes
 		}
 
+		var phaseManagerKey ed25519.PublicKey
+		if lc.PhaseManagerKey != "" {
+			keyBytes, err := base64.StdEncoding.DecodeString(lc.PhaseManagerKey)
+			if err != nil {
+				fatalError(logger, "failed to decode phase_manager key", "err", err)
+			}
+			if len(keyBytes) != ed25519.PublicKeySize {
+				fatalError(logger, "invalid phase_manager key length", "len", len(keyBytes))
+			}
+			phaseManagerKey = ed25519.PublicKey(keyBytes)
+		}
+
 		cc := &ctlog.Config{
-			Name:          prefix.Host + prefix.Path,
-			Key:           k,
-			Cache:         lc.Cache,
-			PoolSize:      lc.PoolSize,
-			Backend:       b,
-			Lock:          db,
-			Log:           logger,
-			EntityKeys:    entityKeys,
-			EntityBLSKeys: entityBLSKeys,
+			Name:            prefix.Host + prefix.Path,
+			Key:             k,
+			Cache:           lc.Cache,
+			PoolSize:        lc.PoolSize,
+			Backend:         b,
+			Lock:            db,
+			Log:             logger,
+			EntityKeys:      entityKeys,
+			EntityBLSKeys:   entityBLSKeys,
+			PhaseManagerKey: phaseManagerKey,
 		}
 
 		if time.Now().Format(time.DateOnly) == lc.Inception {

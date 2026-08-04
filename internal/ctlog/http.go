@@ -95,7 +95,95 @@ func (l *Log) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("POST /submit", submit)
 	mux.Handle("OPTIONS /submit", submit)
-	return http.MaxBytesHandler(mux, 128*1024)
+
+	// PoC read API (patch P1).
+	read := http.HandlerFunc(l.getEntries)
+	mux.Handle("GET /entries", read)
+	mux.Handle("GET /entries/{index}", http.HandlerFunc(l.getEntryByIndex))
+	mux.Handle("GET /phase", http.HandlerFunc(l.getPhase))
+	mux.Handle("GET /checkpoint", http.HandlerFunc(l.getCheckpoint))
+
+	// PoC patch P4: configurable submit body cap (default 128 KiB).
+	maxBody := l.c.MaxSubmitBodyBytes
+	if maxBody <= 0 {
+		maxBody = 128 * 1024
+	}
+	return http.MaxBytesHandler(mux, maxBody)
+}
+
+// setReadCORS allows browser access to the PoC read API.
+func setReadCORS(rw http.ResponseWriter) {
+	rw.Header().Set("Access-Control-Allow-Origin", "*")
+}
+
+// getEntries serves the in-memory index of leaves sequenced by this process:
+// {"count": N, "entries": [{leaf_index, timestamp, entry}, ...]}.
+func (l *Log) getEntries(rw http.ResponseWriter, r *http.Request) {
+	setReadCORS(rw)
+	l.entriesMu.RLock()
+	entries := make([]SequencedEntry, len(l.entries))
+	copy(entries, l.entries)
+	l.entriesMu.RUnlock()
+
+	rw.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(rw).Encode(map[string]interface{}{
+		"count":   len(entries),
+		"entries": entries,
+	})
+}
+
+// getEntryByIndex serves a single leaf by its log index, or 404.
+func (l *Log) getEntryByIndex(rw http.ResponseWriter, r *http.Request) {
+	setReadCORS(rw)
+	index, err := strconv.ParseInt(r.PathValue("index"), 10, 64)
+	if err != nil || index < 0 {
+		http.Error(rw, "invalid leaf index", http.StatusBadRequest)
+		return
+	}
+
+	l.entriesMu.RLock()
+	var found *SequencedEntry
+	for i := range l.entries {
+		if l.entries[i].LeafIndex == index {
+			e := l.entries[i]
+			found = &e
+			break
+		}
+	}
+	l.entriesMu.RUnlock()
+
+	if found == nil {
+		http.Error(rw, "entry not found", http.StatusNotFound)
+		return
+	}
+	rw.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(rw).Encode(found)
+}
+
+// getPhase serves the log's current WBB phase: {"phase": "setup"}.
+func (l *Log) getPhase(rw http.ResponseWriter, r *http.Request) {
+	setReadCORS(rw)
+	l.phaseMu.RLock()
+	phase := l.currentPhase
+	l.phaseMu.RUnlock()
+
+	rw.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(rw).Encode(map[string]interface{}{"phase": phase})
+}
+
+// getCheckpoint serves the latest signed checkpoint (tree head note).
+func (l *Log) getCheckpoint(rw http.ResponseWriter, r *http.Request) {
+	setReadCORS(rw)
+	l.entriesMu.RLock()
+	checkpoint := l.lastCheckpoint
+	l.entriesMu.RUnlock()
+
+	if len(checkpoint) == 0 {
+		http.Error(rw, "no checkpoint", http.StatusNotFound)
+		return
+	}
+	rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	rw.Write(checkpoint)
 }
 
 func (l *Log) submit(rw http.ResponseWriter, r *http.Request) {
@@ -551,9 +639,16 @@ func (l *Log) startGracePeriod(contentHash [32]byte) (endsAt int64, err error) {
 
 	// Start the grace period.
 	//
+	// PoC patch P3: the grace period duration is configurable; zero falls
+	// back to the wbbGracePeriod default (10s).
+	gracePeriod := l.c.GracePeriod
+	if gracePeriod <= 0 {
+		gracePeriod = wbbGracePeriod
+	}
+
 	// We use Unix milliseconds because the rest of the SignedEntry timestamps
 	// are also represented as Unix milliseconds.
-	endsAt = time.Now().Add(wbbGracePeriod).UnixMilli()
+	endsAt = time.Now().Add(gracePeriod).UnixMilli()
 
 	staged.IsGracePeriodStarted = true
 	staged.GracePeriodEndAt = endsAt
@@ -565,7 +660,7 @@ func (l *Log) startGracePeriod(contentHash [32]byte) (endsAt int64, err error) {
 	// When the grace period expires, the server tries to finalize the entry.
 	// finalizeEntry() is race-safe: if the entry was already published earlier,
 	// it will not publish it twice.
-	time.AfterFunc(wbbGracePeriod, func() {
+	time.AfterFunc(gracePeriod, func() {
 		if _, err := l.finalizeEntry(contentHash, context.Background()); err != nil {
 			l.c.Log.WarnContext(
 				context.Background(),
@@ -1226,6 +1321,12 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 
 	body, err := io.ReadAll(reqBody)
 	if err != nil {
+		// PoC patch P4: an over-limit body must surface as 413, not 500.
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			return nil, http.StatusRequestEntityTooLarge, fmtErrorf(
+				"submit body too large (limit %d bytes)", maxBytesErr.Limit)
+		}
 		return nil, http.StatusInternalServerError, fmtErrorf("failed to read body: %w", err)
 	}
 
@@ -1241,7 +1342,9 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 		return nil, http.StatusBadRequest, fmtErrorf("missing timestamp field")
 	}
 
-	if !signedEntry.IsTimestampValid() {
+	// PoC patch P2: the freshness check can be disabled so tests can use
+	// fixed logical timestamps (deterministic artifacts).
+	if !l.c.DisableTimestampValidation && !signedEntry.IsTimestampValid() {
 		return nil, http.StatusBadRequest, fmtErrorf("timestamp too old or in future (max ±5min skew)")
 	}
 

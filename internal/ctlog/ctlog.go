@@ -60,8 +60,27 @@ type Log struct {
 
 	// phaseMu protects currentPhase. The phase can only advance through a
 	// signed PhaseTransition message from the configured phase_manager.
-	phaseMu       sync.RWMutex
-	currentPhase  Phase
+	phaseMu      sync.RWMutex
+	currentPhase Phase
+
+	// entriesMu protects the PoC read-API state (patch P1): the in-memory
+	// index of sequenced leaves and the latest checkpoint bytes.
+	//
+	// PoC-grade limitation (documented): the index is NOT rebuilt from
+	// storage on startup, so /entries only serves leaves sequenced by this
+	// process. lastCheckpoint is initialized from the lock checkpoint.
+	entriesMu      sync.RWMutex
+	entries        []SequencedEntry
+	lastCheckpoint []byte
+}
+
+// SequencedEntry is one leaf of the append-only log, as returned by the
+// PoC read API (GET /entries, GET /entries/{index}). Entry carries the raw
+// SignedEntry JSON exactly as sequenced.
+type SequencedEntry struct {
+	LeafIndex int64           `json:"leaf_index"`
+	Timestamp int64           `json:"timestamp"`
+	Entry     json.RawMessage `json:"entry"`
 }
 
 // StagingEntry tracks partial signatures for a WBB entry until the required
@@ -144,8 +163,27 @@ type Config struct {
 	EntityKeys map[string]ed25519.PublicKey // Optional: override hardcoded entity keys
 
 	// Added
-	EntityBLSKeys    map[string][]byte
-	PhaseManagerKey  ed25519.PublicKey // Optional: external actor that orchestrates phase changes
+	EntityBLSKeys   map[string][]byte
+	PhaseManagerKey ed25519.PublicKey // Optional: external actor that orchestrates phase changes
+
+	// --- PoC extensions (referendum PoC, branch referendum-poc-wbb) ---
+
+	// DisableTimestampValidation turns off the ±5 minute freshness check on
+	// submitted entries (patch P2). It also enables deterministic sequencing:
+	// the empty tree starts at time 0, empty pools are skipped, and every
+	// non-empty pool is timestamped tree.Time+1 — so given the same submission
+	// sequence, leaf timestamps and therefore the Merkle root hash and the
+	// checkpoint text are byte-for-byte reproducible. PoC test mode only.
+	DisableTimestampValidation bool
+
+	// GracePeriod is how long the server waits for additional signers once a
+	// threshold is met, before finalizing a staged entry (patch P3).
+	// Zero falls back to the default of 10 seconds (wbbGracePeriod).
+	GracePeriod time.Duration
+
+	// MaxSubmitBodyBytes caps the /submit request body size in bytes
+	// (patch P4). Zero falls back to the default of 128 KiB.
+	MaxSubmitBodyBytes int64
 }
 
 var ErrLogExists = errors.New("checkpoint already exist, refusing to initialize log")
@@ -175,6 +213,11 @@ func CreateLog(ctx context.Context, config *Config) error {
 	}
 
 	timestamp := timeNowUnixMilli()
+	// PoC patch P2 (deterministic mode): the empty tree starts at time 0 so
+	// the first non-empty pool (timestamp 1) always satisfies monotonicity.
+	if config.DisableTimestampValidation {
+		timestamp = 0
+	}
 	tree, err := hashTreeHead(0, nil, timestamp)
 	if err != nil {
 		return fmt.Errorf("couldn't compute empty tree head: %w", err)
@@ -226,6 +269,14 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 	c, timestamp, err := openCheckpoint(config, lock.Bytes())
 	if err != nil {
 		return nil, fmt.Errorf("couldn't open checkpoint: %w", err)
+	}
+	// PoC patch P2 (deterministic mode): a fresh log's tree clock starts at 0
+	// (openCheckpoint reports wall-clock time otherwise), so pool timestamps
+	// (tree.Time+1) are reproducible. Deterministic mode does not support
+	// restarts of non-empty logs — consistent with the in-memory entries
+	// index (patch P1), both are PoC test facilities.
+	if config.DisableTimestampValidation && c.N == 0 {
+		timestamp = 0
 	}
 
 	sth, err := config.Backend.Fetch(ctx, "checkpoint")
@@ -351,6 +402,8 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 		entityBLSKeys:  entityBLSKeys,
 		staging:        make(map[[32]byte]*StagingEntry),
 		currentPhase:   PhaseSetup,
+		entries:        make([]SequencedEntry, 0),
+		lastCheckpoint: lock.Bytes(),
 	}, nil
 }
 
@@ -627,6 +680,14 @@ func (l *Log) sequencePool(ctx context.Context, p *pool) (err error) {
 	defer cancel()
 
 	timestamp := timeNowUnixMilli()
+	if l.c.DisableTimestampValidation {
+		// PoC patch P2 (deterministic mode): empty pools produce nothing, and
+		// every non-empty pool is timestamped exactly tree.Time+1.
+		if len(p.pendingLeaves) == 0 {
+			return nil
+		}
+		timestamp = l.tree.Time + 1
+	}
 	if timestamp <= l.tree.Time {
 		return fmt.Errorf("%w: time did not progress! %d -> %d", errFatal, l.tree.Time, timestamp)
 	}
@@ -777,6 +838,19 @@ func (l *Log) sequencePool(ctx context.Context, p *pool) (err error) {
 			"tree_size", tree.N, "entries", len(p.pendingLeaves), "err", err)
 		l.m.CachePutErrors.Inc()
 	}
+
+	// PoC read API (patch P1): index the freshly sequenced leaves and track
+	// the latest checkpoint. sequencedLeaves[i].LeafIndex == oldSize + i.
+	l.entriesMu.Lock()
+	for _, e := range sequencedLeaves {
+		l.entries = append(l.entries, SequencedEntry{
+			LeafIndex: e.LeafIndex,
+			Timestamp: e.Timestamp,
+			Entry:     json.RawMessage(e.Data),
+		})
+	}
+	l.lastCheckpoint = checkpoint
+	l.entriesMu.Unlock()
 
 	for _, t := range edgeTiles {
 		l.c.Log.DebugContext(ctx, "edge tile", "tile", t)

@@ -94,6 +94,18 @@ type LogConfig struct {
 	// PhaseManagerKey is a base64-encoded Ed25519 public key of the external
 	// actor that orchestrates phase changes (setup → voting → tallying).
 	PhaseManagerKey string `yaml:"phase_manager_key,omitempty"`
+
+	// --- PoC extensions (referendum PoC, branch referendum-poc-wbb) ---
+
+	// DisableTimestampValidation skips the ±5min freshness check on
+	// submitted entries (patch P2). For PoC tests with fixed logical clocks.
+	DisableTimestampValidation bool `yaml:"disable_timestamp_validation,omitempty"`
+	// GracePeriodMs overrides the staging grace period in milliseconds
+	// (patch P3). Zero uses the default of 10 seconds.
+	GracePeriodMs int `yaml:"grace_period_ms,omitempty"`
+	// MaxSubmitBodyBytes caps the /submit request body size in bytes
+	// (patch P4). Zero uses the default of 128 KiB.
+	MaxSubmitBodyBytes int64 `yaml:"max_submit_body_bytes,omitempty"`
 }
 
 type logInfo struct {
@@ -253,7 +265,7 @@ func main() {
 		}
 
 		var b ctlog.Backend
-	switch {
+		switch {
 		case lc.S3Bucket != "" && lc.LocalDirectory != "":
 			fatalError(logger, "only one of S3Bucket or LocalDirectory can be set")
 		case lc.S3Bucket != "":
@@ -360,6 +372,10 @@ func main() {
 			EntityKeys:      entityKeys,
 			EntityBLSKeys:   entityBLSKeys,
 			PhaseManagerKey: phaseManagerKey,
+
+			DisableTimestampValidation: lc.DisableTimestampValidation,
+			GracePeriod:                time.Duration(lc.GracePeriodMs) * time.Millisecond,
+			MaxSubmitBodyBytes:         lc.MaxSubmitBodyBytes,
 		}
 
 		if time.Now().Format(time.DateOnly) == lc.Inception {

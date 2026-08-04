@@ -38,6 +38,13 @@ const (
 	EntryTallyProof        EntryType = "tally_proof"
 
 	EntryPhaseTransition EntryType = "phase_transition"
+
+	// PoC extensions (referendum PoC roadmap, patch P5):
+	// the ER publishes the eligible-voter pseudonymous id list at the start
+	// of tallying (paper §3.9 step 1), and commitments to ACC revocation
+	// requests during the voting phase (paper §3.7.5).
+	EntryEligibleVids         EntryType = "eligible_vids"
+	EntryRevocationCommitment EntryType = "revocation_commitment"
 )
 
 const (
@@ -130,6 +137,16 @@ func CheckWBBWritePolicy(s string) (bool, error) {
 	}
 
 	if phase == PhaseTallying && role == RoleTT && entryType == EntryTallyProof && threshold >= ThresholdTT {
+		return true, nil
+	}
+
+	// PoC extension (P5): ER publishes the eligible-voter id list at tally start.
+	if phase == PhaseTallying && role == RoleER && entryType == EntryEligibleVids && threshold >= ThresholdOne {
+		return true, nil
+	}
+
+	// PoC extension (P5): ER publishes commitments to ACC revocation requests.
+	if phase == PhaseVoting && role == RoleER && entryType == EntryRevocationCommitment && threshold >= ThresholdOne {
 		return true, nil
 	}
 

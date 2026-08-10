@@ -108,16 +108,22 @@ type LogConfig struct {
 	MaxSubmitBodyBytes int64 `yaml:"max_submit_body_bytes,omitempty"`
 }
 
+type logInterval struct {
+	NotAfterStart string `json:"not_after_start"`
+	NotAfterLimit string `json:"not_after_limit"`
+}
+
 type logInfo struct {
-	Name             string `json:"description"`
-	ShortName        string `json:"friendly_name"`
-	SubmissionPrefix string `json:"submission_url"`
-	MonitoringPrefix string `json:"monitoring_url"`
-	PoolSize         int    `json:"pool_size"`
-	ID               string `json:"log_id"`
-	PublicKeyPEM     string `json:"public_key_pem,omitempty"`
-	PublicKeyDER     []byte `json:"public_key_der,omitempty"`
-	PublicKeyBase64  string `json:"public_key_base64,omitempty"`
+	Name             string      `json:"description"`
+	ShortName        string      `json:"friendly_name"`
+	SubmissionPrefix string      `json:"submission_url"`
+	MonitoringPrefix string      `json:"monitoring_url"`
+	PoolSize         int         `json:"pool_size"`
+	ID               string      `json:"log_id"`
+	PublicKeyPEM     string      `json:"public_key_pem,omitempty"`
+	PublicKeyDER     []byte      `json:"public_key_der,omitempty"`
+	PublicKeyBase64  string      `json:"public_key_base64,omitempty"`
+	Interval         logInterval `json:"interval"`
 	Software         struct {
 		Name    string `json:"name"`
 		Version string `json:"version"`
@@ -236,7 +242,9 @@ func main() {
 		logs[shortName] = li
 	}
 
-	type witnessInfo struct{}
+	type witnessInfo struct {
+		Name string
+	}
 	homeWitnessInfo := func() witnessInfo { return witnessInfo{} }
 
 	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
@@ -312,10 +320,10 @@ func main() {
 		if prefix.Scheme != "https" {
 			fatalError(logger, "SubmissionPrefix must be an https URL", "prefix", lc.SubmissionPrefix)
 		}
-		if prefix.Host == "" {
+		if prefix.Hostname() == "" {
 			fatalError(logger, "SubmissionPrefix must have a host", "prefix", lc.SubmissionPrefix)
 		}
-		if lc.HTTPHost != "" && lc.HTTPHost != prefix.Host {
+		if lc.HTTPHost != "" && lc.HTTPHost != prefix.Hostname() {
 			fatalError(logger, "HTTPHost must match SubmissionPrefix host",
 				"httpHost", lc.HTTPHost, "submissionPrefix", lc.SubmissionPrefix)
 		}
@@ -323,7 +331,7 @@ func main() {
 			fatalError(logger, "HTTPPrefix must match SubmissionPrefix path",
 				"httpPrefix", lc.HTTPPrefix, "submissionPrefix", lc.SubmissionPrefix)
 		}
-		if lc.Name != "" && lc.Name != prefix.Host+prefix.Path {
+		if lc.Name != "" && lc.Name != prefix.Hostname()+prefix.Path {
 			fatalError(logger, "Name must match SubmissionPrefix host and path",
 				"name", lc.Name, "submissionPrefix", lc.SubmissionPrefix)
 		}
@@ -362,7 +370,7 @@ func main() {
 		}
 
 		cc := &ctlog.Config{
-			Name:            prefix.Host + prefix.Path,
+			Name:            prefix.Hostname() + prefix.Path,
 			Key:             k,
 			Cache:           lc.Cache,
 			PoolSize:        lc.PoolSize,
@@ -407,14 +415,14 @@ func main() {
 			return l.RunSequencer(sequencerContext, period)
 		})
 
-		mux.Handle(prefix.Host+prefix.Path+"/", http.StripPrefix(prefix.Path, l.Handler()))
+		mux.Handle(prefix.Hostname()+prefix.Path+"/", http.StripPrefix(prefix.Path, l.Handler()))
 
 		acmeHosts = append(acmeHosts, prefix.Hostname())
 
 		prometheus.WrapRegistererWith(prometheus.Labels{"log": lc.ShortName}, sunlightMetrics).
 			MustRegister(l.Metrics()...)
 
-		mux.HandleFunc(prefix.Host+prefix.Path+"/log.json", func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc(prefix.Hostname()+prefix.Path+"/log.json", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			li, _ := logInfoForShortName(lc.ShortName)
 			e := json.NewEncoder(w)
@@ -500,6 +508,10 @@ func updateMetadata(ctx context.Context, setLogInfo func(string, logInfo), lc Lo
 	}
 	pemKey := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pkix})
 	logID := sha256.Sum256(pkix)
+	notAfterLimit := lc.Inception
+	if t, err := time.Parse(time.DateOnly, lc.Inception); err == nil {
+		notAfterLimit = t.AddDate(2, 0, 0).Format(time.DateOnly)
+	}
 	log := logInfo{
 		Name:             cc.Name,
 		ShortName:        lc.ShortName,
@@ -510,6 +522,10 @@ func updateMetadata(ctx context.Context, setLogInfo func(string, logInfo), lc Lo
 		PublicKeyPEM:     string(pemKey),
 		PublicKeyDER:     pkix,
 		PublicKeyBase64:  base64.StdEncoding.EncodeToString(pkix),
+		Interval: logInterval{
+			NotAfterStart: lc.Inception,
+			NotAfterLimit: notAfterLimit,
+		},
 	}
 	info, _ := debug.ReadBuildInfo()
 	log.Software.Name = info.Main.Path

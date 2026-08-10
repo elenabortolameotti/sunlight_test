@@ -586,7 +586,7 @@ func (l *Log) addLeafToPool(ctx context.Context, leaf *PendingLogEntry) (f waitE
 				return nil, p.err
 			}
 			if p.timestamp == 0 {
-				panic("internal error: pool is ready but result is missing")
+				return nil, fmtErrorf("internal error: pool is ready but result is missing")
 			}
 			idx := p.firstLeafIndex + int64(n)
 			return leaf.asLogEntry(idx, p.timestamp), nil

@@ -112,7 +112,7 @@ func pocSubmit(t *testing.T, server *httptest.Server, wbbData, entityID string, 
 	return resp.StatusCode, body
 }
 
-func pocGet(t *testing.T, url string) (int, []byte) {
+func pocGet(t *testing.T, url string) (int, []byte, string) {
 	t.Helper()
 	resp, err := http.Get(url)
 	if err != nil {
@@ -123,7 +123,7 @@ func pocGet(t *testing.T, url string) (int, []byte) {
 	if err != nil {
 		t.Fatalf("read body of %s: %v", url, err)
 	}
-	return resp.StatusCode, body
+	return resp.StatusCode, body, resp.Header.Get("Access-Control-Allow-Origin")
 }
 
 type pocEntriesResponse struct {
@@ -150,9 +150,12 @@ func TestPoCReadAPI(t *testing.T) {
 	}
 
 	// GET /entries
-	code, body := pocGet(t, server.URL+"/entries")
+	code, body, cors := pocGet(t, server.URL+"/entries")
 	if code != http.StatusOK {
 		t.Fatalf("GET /entries: expected 200, got %d", code)
+	}
+	if cors != "*" {
+		t.Errorf("GET /entries: expected CORS *, got %q", cors)
 	}
 	var entries pocEntriesResponse
 	if err := json.Unmarshal(body, &entries); err != nil {
@@ -175,9 +178,12 @@ func TestPoCReadAPI(t *testing.T) {
 	}
 
 	// GET /entries/1
-	code, body = pocGet(t, server.URL+"/entries/1")
+	code, body, cors = pocGet(t, server.URL+"/entries/1")
 	if code != http.StatusOK {
 		t.Fatalf("GET /entries/1: expected 200, got %d", code)
+	}
+	if cors != "*" {
+		t.Errorf("GET /entries/1: expected CORS *, got %q", cors)
 	}
 	var single struct {
 		LeafIndex int64           `json:"leaf_index"`
@@ -195,23 +201,29 @@ func TestPoCReadAPI(t *testing.T) {
 	}
 
 	// GET /entries/99 → 404; GET /entries/-1 → 400
-	if code, _ := pocGet(t, server.URL+"/entries/99"); code != http.StatusNotFound {
+	if code, _, _ := pocGet(t, server.URL+"/entries/99"); code != http.StatusNotFound {
 		t.Errorf("GET /entries/99: expected 404, got %d", code)
 	}
-	if code, _ := pocGet(t, server.URL+"/entries/-1"); code != http.StatusBadRequest {
+	if code, _, _ := pocGet(t, server.URL+"/entries/-1"); code != http.StatusBadRequest {
 		t.Errorf("GET /entries/-1: expected 400, got %d", code)
 	}
 
 	// GET /phase
-	code, body = pocGet(t, server.URL+"/phase")
+	code, body, cors = pocGet(t, server.URL+"/phase")
 	if code != http.StatusOK || !strings.Contains(string(body), `"phase":"setup"`) {
 		t.Errorf("GET /phase: expected setup, got %d %s", code, body)
 	}
+	if cors != "*" {
+		t.Errorf("GET /phase: expected CORS *, got %q", cors)
+	}
 
 	// GET /checkpoint — the signed note starts with the log origin name.
-	code, body = pocGet(t, server.URL+"/checkpoint")
+	code, body, cors = pocGet(t, server.URL+"/checkpoint")
 	if code != http.StatusOK {
 		t.Fatalf("GET /checkpoint: expected 200, got %d", code)
+	}
+	if cors != "*" {
+		t.Errorf("GET /checkpoint: expected CORS *, got %q", cors)
 	}
 	if !strings.HasPrefix(string(body), "test.poc.example.com\n") {
 		t.Errorf("checkpoint does not start with origin: %q", body)
@@ -277,7 +289,7 @@ func TestPoCGracePeriodMs(t *testing.T) {
 
 	// After the (short) grace period, the entry is finalized and readable.
 	time.Sleep(400 * time.Millisecond)
-	code, body = pocGet(t, server.URL+"/entries")
+	code, body, _ = pocGet(t, server.URL+"/entries")
 	if code != http.StatusOK {
 		t.Fatalf("GET /entries: %d", code)
 	}
@@ -321,6 +333,27 @@ func TestPoCMaxSubmitBodyBytes(t *testing.T) {
 	code, body = pocSubmit(t, server, big, "ER-1", now, privs["ER-1"])
 	if code != http.StatusRequestEntityTooLarge {
 		t.Errorf("big entry: expected 413, got %d: %s", code, body)
+	}
+}
+
+func TestPoCMaxSubmitBodyBytesDefault(t *testing.T) {
+	pubs, privs := pocKeys(t, "ER-1")
+	server := startPoCLog(t, pubs, nil, nil) // default limit = 128 KiB
+
+	now := time.Now().UnixMilli()
+
+	// Just under 128 KiB total body passes.
+	under := "setup,ER,election_pub_key,1," + strings.Repeat("A", 90*1024)
+	code, body := pocSubmit(t, server, under, "ER-1", now, privs["ER-1"])
+	if code != http.StatusOK {
+		t.Fatalf("under default limit: expected 200, got %d: %s", code, body)
+	}
+
+	// Over 128 KiB returns 413.
+	over := "setup,ER,election_pub_key,1," + strings.Repeat("A", 200*1024)
+	code, body = pocSubmit(t, server, over, "ER-1", now, privs["ER-1"])
+	if code != http.StatusRequestEntityTooLarge {
+		t.Errorf("over default limit: expected 413, got %d: %s", code, body)
 	}
 }
 

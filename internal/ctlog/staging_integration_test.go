@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -56,12 +57,28 @@ func TestStagingIntegration(t *testing.T) {
 	}
 	defer log.CloseCache()
 
-	// Start sequencer.
+	// Start sequencer.  The goroutine must be joined before CloseCache runs
+	// (deferred above, so it executes after this cancel+wait defer): a
+	// Sequence() racing the cache close panics the whole test binary with
+	// SQLITE_MISUSE inside sqlitex.Save.
+	seqCtx, seqCancel := context.WithCancel(context.Background())
+	var seqWg sync.WaitGroup
+	seqWg.Add(1)
+	defer func() {
+		seqCancel()
+		seqWg.Wait()
+	}()
 	go func() {
+		defer seqWg.Done()
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
-		for range ticker.C {
-			_ = log.Sequence()
+		for {
+			select {
+			case <-seqCtx.Done():
+				return
+			case <-ticker.C:
+				_ = log.Sequence()
+			}
 		}
 	}()
 

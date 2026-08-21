@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -82,9 +83,18 @@ func startPoCLog(t *testing.T, entityKeys map[string]ed25519.PublicKey, pmKey ed
 	server := httptest.NewServer(log.Handler())
 	t.Cleanup(server.Close)
 
+	// Cancel AND join the sequencer before the (earlier-registered, so
+	// later-run) CloseCache cleanup: a Sequence() racing the cache close
+	// panics the test binary with SQLITE_MISUSE inside sqlitex.Save.
 	seqCtx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	var seqWg sync.WaitGroup
+	seqWg.Add(1)
+	t.Cleanup(func() {
+		cancel()
+		seqWg.Wait()
+	})
 	go func() {
+		defer seqWg.Done()
 		ticker := time.NewTicker(20 * time.Millisecond)
 		defer ticker.Stop()
 		for {

@@ -198,4 +198,24 @@ The Tuscolo public configs include [an example of how to schedule it with system
 
 ### Forked version of sunlight
 
+Referendum PoC additions (branch `referendum-poc-wbb`), on top of the WBB
+policy/staging/phase-manager work:
+
+- **Read API** (`GET /entries`, `GET /entries/{index}`, `GET /phase`,
+  `GET /checkpoint`), deterministic sequencing mode, configurable grace period
+  and submit body cap, extra policy entry types.
+- **Validators** (`validator_bls_keys` per-log config, `POST /validations`,
+  `cmd/wbb-validator`): independent parties that fetch the signed checkpoint,
+  verify the log's signature, rebuild the Merkle tree from the published
+  leaves (`internal/validation`), check the root and every inclusion proof,
+  and BLS-sign each leaf over `wbb-validation/v1 || origin || index || leaf
+  hash`. The log verifies each signature against the registered key and
+  serves the per-leaf signatures plus their BLS aggregate in the read API.
+
+```sh
+wbb-validator -name V-1 -seed-file v1-seed.bin -print-key   # -> validator_bls_keys
+wbb-validator -name V-1 -seed-file v1-seed.bin -log https://127.0.0.1:8090/wbb \
+    -cacert ca.pem -interval 1s -delay 3s
+```
+
 Personal version for intership

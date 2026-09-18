@@ -19,8 +19,10 @@ import (
 	"time"
 
 	"filippo.io/sunlight/internal/my_crypto"
+	"filippo.io/sunlight/internal/validation"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/mod/sumdb/tlog"
 )
 
 // SignedEntry represents a signed log entry with authentication
@@ -103,6 +105,9 @@ func (l *Log) Handler() http.Handler {
 	mux.Handle("GET /phase", http.HandlerFunc(l.getPhase))
 	mux.Handle("GET /checkpoint", http.HandlerFunc(l.getCheckpoint))
 
+	// PoC validators (patch P6).
+	mux.Handle("POST /validations", http.HandlerFunc(l.submitValidation))
+
 	// PoC patch P4: configurable submit body cap (default 128 KiB).
 	maxBody := l.c.MaxSubmitBodyBytes
 	if maxBody <= 0 {
@@ -117,18 +122,144 @@ func setReadCORS(rw http.ResponseWriter) {
 }
 
 // getEntries serves the in-memory index of leaves sequenced by this process:
-// {"count": N, "entries": [{leaf_index, timestamp, entry}, ...]}.
+// {"count": N, "entries": [{leaf_index, timestamp, entry, leaf_hash,
+// validations, aggregate_signature}, ...], "validators": [ids]}.
 func (l *Log) getEntries(rw http.ResponseWriter, r *http.Request) {
 	setReadCORS(rw)
 	l.entriesMu.RLock()
-	entries := make([]SequencedEntry, len(l.entries))
-	copy(entries, l.entries)
+	entries := make([]ValidatedEntry, 0, len(l.entries))
+	for i := range l.entries {
+		entries = append(entries, l.validatedEntryLocked(&l.entries[i]))
+	}
+	validators := l.validatorIDsLocked()
 	l.entriesMu.RUnlock()
 
 	rw.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(rw).Encode(map[string]interface{}{
-		"count":   len(entries),
-		"entries": entries,
+		"count":      len(entries),
+		"entries":    entries,
+		"validators": validators,
+	})
+}
+
+// validatorIDsLocked lists the configured validators, sorted. Caller holds
+// entriesMu (read).
+func (l *Log) validatorIDsLocked() []string {
+	ids := make([]string, 0, len(l.validatorKeys))
+	for id := range l.validatorKeys {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// leafHashOf recomputes the Merkle leaf hash of a sequenced entry.
+func leafHashOf(e *SequencedEntry) tlog.Hash {
+	return validation.LeafHash(e.Entry, e.LeafIndex, e.Timestamp)
+}
+
+// validatedEntryLocked decorates a sequenced leaf with its validations.
+// Caller holds entriesMu (read).
+func (l *Log) validatedEntryLocked(e *SequencedEntry) ValidatedEntry {
+	leafHash := leafHashOf(e)
+	out := ValidatedEntry{
+		LeafIndex:   e.LeafIndex,
+		Timestamp:   e.Timestamp,
+		Entry:       e.Entry,
+		LeafHash:    hex.EncodeToString(leafHash[:]),
+		Validations: []Validation{},
+	}
+	sigs := l.validations[e.LeafIndex]
+	ids := make([]string, 0, len(sigs))
+	for id := range sigs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	raw := make([][]byte, 0, len(ids))
+	for _, id := range ids {
+		out.Validations = append(out.Validations, Validation{ValidatorID: id, Signature: sigs[id]})
+		raw = append(raw, sigs[id])
+	}
+	if len(raw) > 0 {
+		if agg, err := my_crypto.AggregateSignaturesBytes(raw); err == nil {
+			out.AggregateSignature = agg
+		}
+	}
+	return out
+}
+
+// ValidationRequest is the body of POST /validations (patch P6).
+type ValidationRequest struct {
+	ValidatorID string `json:"validator_id"`
+	LeafIndex   int64  `json:"leaf_index"`
+	// Signature is the compressed BLS signature over validation.Message.
+	Signature []byte `json:"signature"`
+}
+
+// submitValidation stores one validator's BLS signature over a sequenced
+// leaf after verifying it against the validator's registered key and the
+// leaf hash the log itself computed. Idempotent per (leaf, validator).
+func (l *Log) submitValidation(rw http.ResponseWriter, r *http.Request) {
+	setReadCORS(rw)
+	var req ValidationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(rw, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	l.entriesMu.RLock()
+	pubKey, known := l.validatorKeys[req.ValidatorID]
+	var entry *SequencedEntry
+	for i := range l.entries {
+		if l.entries[i].LeafIndex == req.LeafIndex {
+			e := l.entries[i]
+			entry = &e
+			break
+		}
+	}
+	l.entriesMu.RUnlock()
+
+	if !known {
+		http.Error(rw, "unknown validator", http.StatusForbidden)
+		return
+	}
+	if entry == nil {
+		http.Error(rw, "entry not found", http.StatusNotFound)
+		return
+	}
+	pk, err := my_crypto.PublicKeyFromBytes(pubKey)
+	if err != nil {
+		http.Error(rw, "validator key unusable", http.StatusInternalServerError)
+		return
+	}
+	sig, err := my_crypto.SignatureFromBytes(req.Signature)
+	if err != nil {
+		http.Error(rw, "malformed BLS signature", http.StatusBadRequest)
+		return
+	}
+	msg := validation.Message(l.c.Name, entry.LeafIndex, leafHashOf(entry))
+	if !my_crypto.Verify(pk, msg, sig) {
+		http.Error(rw, "invalid validation signature", http.StatusBadRequest)
+		return
+	}
+
+	l.entriesMu.Lock()
+	if l.validations[req.LeafIndex] == nil {
+		l.validations[req.LeafIndex] = make(map[string][]byte)
+	}
+	l.validations[req.LeafIndex][req.ValidatorID] = append([]byte(nil), req.Signature...)
+	count := len(l.validations[req.LeafIndex])
+	total := len(l.validatorKeys)
+	l.entriesMu.Unlock()
+
+	l.c.Log.InfoContext(r.Context(), "leaf validated", "validator", req.ValidatorID,
+		"leaf_index", req.LeafIndex, "validations", count, "validators", total)
+	rw.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(rw).Encode(map[string]interface{}{
+		"leaf_index":       req.LeafIndex,
+		"validator_id":     req.ValidatorID,
+		"validations":      count,
+		"validators_total": total,
 	})
 }
 
@@ -142,10 +273,10 @@ func (l *Log) getEntryByIndex(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	l.entriesMu.RLock()
-	var found *SequencedEntry
+	var found *ValidatedEntry
 	for i := range l.entries {
 		if l.entries[i].LeafIndex == index {
-			e := l.entries[i]
+			e := l.validatedEntryLocked(&l.entries[i])
 			found = &e
 			break
 		}

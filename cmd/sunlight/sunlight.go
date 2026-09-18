@@ -34,6 +34,7 @@ import (
 	"filippo.io/sunlight/internal/ctlog"
 	"filippo.io/sunlight/internal/heavyhitter"
 	"filippo.io/sunlight/internal/keylog"
+	"filippo.io/sunlight/internal/my_crypto"
 	"filippo.io/sunlight/internal/reused"
 	"filippo.io/sunlight/internal/stdlog"
 	"github.com/prometheus/client_golang/prometheus"
@@ -106,6 +107,10 @@ type LogConfig struct {
 	// MaxSubmitBodyBytes caps the /submit request body size in bytes
 	// (patch P4). Zero uses the default of 128 KiB.
 	MaxSubmitBodyBytes int64 `yaml:"max_submit_body_bytes,omitempty"`
+	// ValidatorBLSKeys maps validator ids to base64 compressed BLS public
+	// keys (patch P6). Validators check the Merkle tree and BLS-sign every
+	// leaf via POST /validations.
+	ValidatorBLSKeys map[string]string `yaml:"validator_bls_keys,omitempty"`
 }
 
 type logInterval struct {
@@ -357,6 +362,18 @@ func main() {
 			entityBLSKeys[id] = keyBytes
 		}
 
+		validatorBLSKeys := make(map[string][]byte)
+		for id, keyB64 := range lc.ValidatorBLSKeys {
+			keyBytes, err := base64.StdEncoding.DecodeString(keyB64)
+			if err != nil {
+				fatalError(logger, "failed to decode validator BLS key", "validator", id, "err", err)
+			}
+			if _, err := my_crypto.PublicKeyFromBytes(keyBytes); err != nil {
+				fatalError(logger, "invalid validator BLS key", "validator", id, "err", err)
+			}
+			validatorBLSKeys[id] = keyBytes
+		}
+
 		var phaseManagerKey ed25519.PublicKey
 		if lc.PhaseManagerKey != "" {
 			keyBytes, err := base64.StdEncoding.DecodeString(lc.PhaseManagerKey)
@@ -384,9 +401,10 @@ func main() {
 			DisableTimestampValidation: lc.DisableTimestampValidation,
 			GracePeriod:                time.Duration(lc.GracePeriodMs) * time.Millisecond,
 			MaxSubmitBodyBytes:         lc.MaxSubmitBodyBytes,
+			ValidatorBLSKeys:           validatorBLSKeys,
 		}
 
-		if time.Now().Format(time.DateOnly) == lc.Inception {
+		if isInceptionToday(lc.Inception) {
 			logger.Info("today is the Inception date, creating log")
 			if err := ctlog.CreateLog(ctx, cc); err == ctlog.ErrLogExists {
 				logger.Info("log exists")
@@ -398,7 +416,8 @@ func main() {
 		l, err := ctlog.LoadLog(ctx, cc)
 		if errors.Is(err, ctlog.ErrLogNotFound) {
 			fatalError(logger, "log not found, but today is not the Inception date",
-				"today", time.Now().Format(time.DateOnly), "inception", lc.Inception)
+				"today", time.Now().Format(time.DateOnly),
+				"today_utc", time.Now().UTC().Format(time.DateOnly), "inception", lc.Inception)
 		} else if err != nil {
 			fatalError(logger, "failed to load log", "err", err)
 		}
@@ -438,6 +457,11 @@ func main() {
 		ConnContext:  reused.ConnContext,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 15 * time.Second,
+		// Without an explicit value the idle timeout falls back to ReadTimeout:
+		// the board then closes a kept-alive connection after 5 s of silence
+		// while clients still pool it, and the next request on it fails with
+		// "connection closed before message completed".
+		IdleTimeout:  2 * time.Minute,
 		ErrorLog:     stdlog.HTTPErrorLog,
 	}
 	if *testCertFlag {
@@ -499,6 +523,15 @@ func main() {
 	}
 
 	os.Exit(1)
+}
+
+// isInceptionToday reports whether the configured inception date is today
+// in local time OR in UTC. The PoC ceremony stamps the inception in UTC while
+// operators run in local time; around midnight the two dates differ and the
+// log must still be creatable (referendum PoC).
+func isInceptionToday(inception string) bool {
+	now := time.Now()
+	return now.Format(time.DateOnly) == inception || now.UTC().Format(time.DateOnly) == inception
 }
 
 func updateMetadata(ctx context.Context, setLogInfo func(string, logInfo), lc LogConfig, cc *ctlog.Config) error {

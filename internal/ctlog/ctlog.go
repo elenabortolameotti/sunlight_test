@@ -28,6 +28,7 @@ import (
 
 	"crawshaw.io/sqlite"
 	"filippo.io/sunlight"
+	"filippo.io/sunlight/internal/validation"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/mod/sumdb/note"
 	"golang.org/x/mod/sumdb/tlog"
@@ -66,12 +67,42 @@ type Log struct {
 	// entriesMu protects the PoC read-API state (patch P1): the in-memory
 	// index of sequenced leaves and the latest checkpoint bytes.
 	//
-	// PoC-grade limitation (documented): the index is NOT rebuilt from
-	// storage on startup, so /entries only serves leaves sequenced by this
-	// process. lastCheckpoint is initialized from the lock checkpoint.
+	// On startup the index is rebuilt from the data tiles and checked against
+	// the signed tree head (rebuildReadIndex), and the phase is replayed from
+	// the published phase_transition leaves. lastCheckpoint is initialized
+	// from the lock checkpoint. Validator signatures and the staging area are
+	// not persisted: validators simply re-sign after a restart.
 	entriesMu      sync.RWMutex
 	entries        []SequencedEntry
 	lastCheckpoint []byte
+
+	// PoC validators (patch P6): validatorKeys maps validator ids to their
+	// compressed BLS public keys; validations holds, per leaf index, the BLS
+	// signature each validator submitted after verifying the leaf's Merkle
+	// inclusion. Both live under entriesMu. In-memory only, like entries.
+	validatorKeys map[string][]byte
+	validations   map[int64]map[string][]byte
+}
+
+// Validation is one validator's BLS signature over a sequenced leaf.
+type Validation struct {
+	ValidatorID string `json:"validator_id"`
+	Signature   []byte `json:"signature"`
+}
+
+// ValidatedEntry is a sequenced leaf together with its validator
+// signatures, as served by the read API (patch P6).
+type ValidatedEntry struct {
+	LeafIndex int64           `json:"leaf_index"`
+	Timestamp int64           `json:"timestamp"`
+	Entry     json.RawMessage `json:"entry"`
+	// LeafHash is the hex Merkle leaf hash (what the validators sign over).
+	LeafHash string `json:"leaf_hash"`
+	// Validations are sorted by validator id.
+	Validations []Validation `json:"validations"`
+	// AggregateSignature is the BLS aggregate of all Validations, verifiable
+	// in one pairing against the signers' public keys.
+	AggregateSignature []byte `json:"aggregate_signature,omitempty"`
 }
 
 // SequencedEntry is one leaf of the append-only log, as returned by the
@@ -184,6 +215,11 @@ type Config struct {
 	// MaxSubmitBodyBytes caps the /submit request body size in bytes
 	// (patch P4). Zero falls back to the default of 128 KiB.
 	MaxSubmitBodyBytes int64
+
+	// ValidatorBLSKeys maps validator ids to compressed BLS public keys
+	// (patch P6). Validators verify the Merkle tree and BLS-sign each leaf
+	// through POST /validations; empty disables the feature.
+	ValidatorBLSKeys map[string][]byte
 }
 
 var ErrLogExists = errors.New("checkpoint already exist, refusing to initialize log")
@@ -272,9 +308,10 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 	}
 	// PoC patch P2 (deterministic mode): a fresh log's tree clock starts at 0
 	// (openCheckpoint reports wall-clock time otherwise), so pool timestamps
-	// (tree.Time+1) are reproducible. Deterministic mode does not support
-	// restarts of non-empty logs — consistent with the in-memory entries
-	// index (patch P1), both are PoC test facilities.
+	// (tree.Time+1) are reproducible. A restarted NON-empty deterministic log
+	// keeps its entries and phase like any other, but its tree clock resumes
+	// from wall time, so artifacts sequenced after the restart are no longer
+	// reproducible: deterministic mode is a test facility, not for restarts.
 	if config.DisableTimestampValidation && c.N == 0 {
 		timestamp = 0
 	}
@@ -308,6 +345,27 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 		}
 	}
 
+	// PoC restart safety: rebuild the read index from the data tiles and
+	// verify it against the tree head, so /entries survives a restart. The
+	// tree head is authenticated first: openCheckpoint only parses the note,
+	// so check the log's own signature on it before trusting its root.
+	if c.N > 0 {
+		signer, err := newECDSASigner(config.Name, config.Key, 0)
+		if err != nil {
+			return nil, fmt.Errorf("couldn't build the checkpoint verifier: %w", err)
+		}
+		verifier := signer.(*ecdsaSigner).Verifier()
+		if _, err := note.Open(lock.Bytes(), note.VerifierList(verifier)); err != nil {
+			return nil, fmt.Errorf("lock checkpoint is not signed by this log's key: %w", err)
+		}
+	}
+	entries, err := rebuildReadIndex(ctx, config, c.Tree)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't rebuild the read index: %w", err)
+	}
+
+	// Everything that can refuse the stored log runs BEFORE the cache
+	// database is opened, so a refused load leaves nothing open.
 	cacheRead, cacheWrite, err := initCache(config.Cache)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't initialize cache database: %w", err)
@@ -388,7 +446,13 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 		entityBLSKeys = map[string][]byte{}
 	}
 
-	return &Log{
+	// PoC validators (patch P6): public keys only.
+	validatorKeys := map[string][]byte{}
+	for id, key := range config.ValidatorBLSKeys {
+		validatorKeys[id] = key
+	}
+
+	l := &Log{
 		c:              config,
 		logID:          logID,
 		m:              m,
@@ -402,9 +466,80 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 		entityBLSKeys:  entityBLSKeys,
 		staging:        make(map[[32]byte]*StagingEntry),
 		currentPhase:   PhaseSetup,
-		entries:        make([]SequencedEntry, 0),
+		entries:        entries,
+		validatorKeys:  validatorKeys,
+		validations:    make(map[int64]map[string][]byte),
 		lastCheckpoint: lock.Bytes(),
-	}, nil
+	}
+	// The phase lives in the log itself: replay every published
+	// phase_transition so a restarted board resumes in the phase it had
+	// reached instead of falling back to setup (phases only move forward).
+	l.replayPhaseTransitions()
+	return l, nil
+}
+
+// rebuildReadIndex reads every leaf of the tree from the data tiles, checks
+// that the leaves hash to the signed tree head, and returns them as the
+// read-API index. An empty tree yields an empty index.
+func rebuildReadIndex(ctx context.Context, config *Config, tree tlog.Tree) ([]SequencedEntry, error) {
+	entries := make([]SequencedEntry, 0, tree.N)
+	leaves := make([]tlog.Hash, 0, tree.N)
+	for start := int64(0); start < tree.N; start += sunlight.TileWidth {
+		width := min(tree.N-start, int64(sunlight.TileWidth))
+		tile := tlog.Tile{H: sunlight.TileHeight, L: -1, N: start / sunlight.TileWidth, W: int(width)}
+		b, err := fetchAndDecompress(ctx, config.Backend, sunlight.TilePath(tile))
+		if err != nil {
+			return nil, fmt.Errorf("data tile %v: %w", tile, err)
+		}
+		for i := start; i < start+width; i++ {
+			e, rest, err := sunlight.ReadTileLeaf(b)
+			if err != nil {
+				return nil, fmt.Errorf("data tile %v, leaf %d: %w", tile, i, err)
+			}
+			b = rest
+			if e.LeafIndex != i {
+				return nil, fmt.Errorf("data tile %v: leaf %d stored at position %d", tile, e.LeafIndex, i)
+			}
+			entries = append(entries, SequencedEntry{
+				LeafIndex: e.LeafIndex,
+				Timestamp: e.Timestamp,
+				Entry:     json.RawMessage(e.Data),
+			})
+			leaves = append(leaves, tlog.RecordHash(e.MerkleTreeLeaf()))
+		}
+	}
+	if tree.N == 0 {
+		return entries, nil
+	}
+	rebuilt, err := validation.BuildTree(leaves)
+	if err != nil {
+		return nil, err
+	}
+	root, err := rebuilt.Root()
+	if err != nil {
+		return nil, err
+	}
+	if root != tree.Hash {
+		return nil, fmt.Errorf("data tiles hash to %x, the signed tree head is %x", root[:], tree.Hash[:])
+	}
+	return entries, nil
+}
+
+// replayPhaseTransitions re-applies, in log order, every phase_transition
+// leaf. Published transitions were authorised when they were accepted, and
+// applyPhaseTransitionIfNeeded only ever moves the phase forward.
+func (l *Log) replayPhaseTransitions() {
+	for i := range l.entries {
+		var signed SignedEntry
+		if err := json.Unmarshal(l.entries[i].Entry, &signed); err != nil {
+			continue
+		}
+		wbbEntry, err := ParseWBBEntry(string(signed.Data))
+		if err != nil {
+			continue
+		}
+		l.applyPhaseTransitionIfNeeded(wbbEntry)
+	}
 }
 
 func mustDecodeKey(hexStr string) ed25519.PublicKey {
@@ -968,6 +1103,9 @@ func signTreeHead(c *Config, tree treeWithTimestamp) (checkpoint []byte, err err
 	return signedNote, nil
 }
 
+// ecdsaScalarSize is the byte width of r and s for the log's P-256 key.
+const ecdsaScalarSize = 32
+
 // ecdsaSigner implements note.Signer for ECDSA keys
 type ecdsaSigner struct {
 	name      string
@@ -1007,11 +1145,13 @@ func (s *ecdsaSigner) Sign(msg []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	// Encode as: timestamp (8 bytes) + r (32 bytes) + s (32 bytes)
+	// Encode as: timestamp (8 bytes) + r (32 bytes) + s (32 bytes), both
+	// FIXED width. big.Int.Bytes drops leading zeros, and a verifier that
+	// splits the pair in the middle then misreads about one signature in 260.
 	var buf bytes.Buffer
 	binary.Write(&buf, binary.BigEndian, uint64(s.timestamp))
-	buf.Write(r.Bytes())
-	buf.Write(sig.Bytes())
+	buf.Write(r.FillBytes(make([]byte, ecdsaScalarSize)))
+	buf.Write(sig.FillBytes(make([]byte, ecdsaScalarSize)))
 
 	return buf.Bytes(), nil
 }
@@ -1036,11 +1176,13 @@ func (v *ecdsaVerifier) Verify(msg, sig []byte) bool {
 	if len(sig) < 8 {
 		return false
 	}
-	// Skip timestamp (first 8 bytes)
+	// Skip timestamp (first 8 bytes); r and s are fixed width.
 	sigData := sig[8:]
-	mid := len(sigData) / 2
-	r := new(big.Int).SetBytes(sigData[:mid])
-	s := new(big.Int).SetBytes(sigData[mid:])
+	if len(sigData) != 2*ecdsaScalarSize {
+		return false
+	}
+	r := new(big.Int).SetBytes(sigData[:ecdsaScalarSize])
+	s := new(big.Int).SetBytes(sigData[ecdsaScalarSize:])
 
 	digest := sha256.Sum256(msg)
 	return ecdsa.Verify(v.key, digest[:], r, s)

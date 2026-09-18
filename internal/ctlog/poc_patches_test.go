@@ -381,9 +381,11 @@ func TestPoCNewPolicyEntryTypes(t *testing.T) {
 	if code != http.StatusForbidden {
 		t.Errorf("eligible_vids in setup: expected 403, got %d: %s", code, body)
 	}
-	code, body = pocSubmit(t, server, "setup,ER,revocation_commitment,1,abc", "ER-1", now, privs["ER-1"])
-	if code != http.StatusForbidden {
-		t.Errorf("revocation_commitment in setup: expected 403, got %d: %s", code, body)
+	// A revocation commitment is accepted already in setup: enrollment, and
+	// therefore revocation, happens inside the setup write window.
+	code, body = pocSubmit(t, server, "setup,ER,revocation_commitment,1,early", "ER-1", now, privs["ER-1"])
+	if code != http.StatusOK {
+		t.Errorf("revocation_commitment in setup: expected 200, got %d: %s", code, body)
 	}
 
 	// setup → voting.

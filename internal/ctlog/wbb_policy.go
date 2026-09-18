@@ -146,7 +146,10 @@ func CheckWBBWritePolicy(s string) (bool, error) {
 	}
 
 	// PoC extension (P5): ER publishes commitments to ACC revocation requests.
-	if phase == PhaseVoting && role == RoleER && entryType == EntryRevocationCommitment && threshold >= ThresholdOne {
+	// A credential can be revoked as soon as the voter has enrolled, and
+	// enrollment happens inside the setup write window (the log has three
+	// phases), so the commitment is accepted in setup as well as in voting.
+	if (phase == PhaseSetup || phase == PhaseVoting) && role == RoleER && entryType == EntryRevocationCommitment && threshold >= ThresholdOne {
 		return true, nil
 	}
 

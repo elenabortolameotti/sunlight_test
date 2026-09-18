@@ -2,8 +2,11 @@ package ctlog
 
 import (
 	"context"
+	"crypto/ecdsa"
 
 	"filippo.io/sunlight"
+	"golang.org/x/mod/sumdb/note"
+	"golang.org/x/mod/sumdb/tlog"
 )
 
 var ErrEvicted = errEvicted
@@ -38,4 +41,18 @@ func PauseSequencer() {
 
 func ResumeSequencer() {
 	close(seqRunning)
+}
+
+// SignTreeHeadForTest signs a tree head exactly as the sequencer does.
+func SignTreeHeadForTest(name string, key *ecdsa.PrivateKey, n int64, hash tlog.Hash, time int64) ([]byte, error) {
+	return signTreeHead(&Config{Name: name, Key: key}, treeWithTimestamp{Tree: tlog.Tree{N: n, Hash: hash}, Time: time})
+}
+
+// CheckpointVerifierForTest is the verifier LoadLog uses on the lock checkpoint.
+func CheckpointVerifierForTest(name string, key *ecdsa.PrivateKey) (note.Verifier, error) {
+	signer, err := newECDSASigner(name, key, 0)
+	if err != nil {
+		return nil, err
+	}
+	return signer.(*ecdsaSigner).Verifier(), nil
 }

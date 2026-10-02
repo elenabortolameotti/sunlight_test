@@ -79,3 +79,23 @@ func (l *Log) cachePut(entries []*sunlight.LogEntry) (err error) {
 	}
 	return nil
 }
+
+// reseedCache makes sure every leaf already in the log is in the
+// deduplication cache. The cache is a separate file that upstream allows to
+// be lost ("existing entries might be resubmitted") - for a certificate log
+// a harmless duplicate, for this board a second copy of a once-only election
+// artifact that no audit can forgive. Anything in the log is therefore put
+// back into the cache at startup, from the leaves rebuildReadIndex verified.
+func (l *Log) reseedCache() (err error) {
+	defer sqlitex.Save(l.cacheWrite)(&err)
+	for _, e := range l.entries {
+		h := computeCacheHash(e.Entry)
+		err := sqlitex.Exec(l.cacheWrite,
+			"INSERT OR IGNORE INTO cache (key, timestamp, leaf_index) VALUES (?, ?, ?)",
+			nil, h[:], e.Timestamp, e.LeafIndex)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}

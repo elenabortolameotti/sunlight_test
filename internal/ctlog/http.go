@@ -693,26 +693,6 @@ func (l *Log) stageSubmission(contentHash [32]byte, signedEntry SignedEntry, wbb
 	return len(staged.Submissions), isNew, nil
 }
 
-// cleanupPublishedStagingForPhase removes published staging entries belonging
-// to the given phase.
-//
-// This is only a memory cleanup: published entries are already stored in the
-// append-only log, so removing them from the in-memory staging map does not
-// remove anything from the Merkle tree.
-//
-// Unpublished entries are deliberately kept, because deleting them could lose
-// partial signatures that have not reached publication yet.
-func (l *Log) cleanupPublishedStagingForPhase(phase Phase) {
-	l.stagingMu.Lock()
-	defer l.stagingMu.Unlock()
-
-	for contentHash, staged := range l.staging {
-		if staged.IsPublished && staged.Phase == phase {
-			delete(l.staging, contentHash)
-		}
-	}
-}
-
 func (l *Log) checkThreshold(contentHash [32]byte) (count int, thresholdMet bool, err error) {
 	l.stagingMu.Lock()
 	defer l.stagingMu.Unlock()
@@ -961,8 +941,9 @@ func (l *Log) finalizeEntry(contentHash [32]byte, ctx context.Context) (leafInde
 		staged.LeafIndex = seq.LeafIndex
 		// Preserve the original leaf index so late arrivals always reference
 		// the first published leaf, not a subsequent late-arrival leaf.
-		if staged.OriginalLeafIndex == 0 {
+		if !staged.HasOriginalLeafIndex {
 			staged.OriginalLeafIndex = seq.LeafIndex
+			staged.HasOriginalLeafIndex = true
 		}
 	}
 	l.stagingMu.Unlock()
@@ -1127,7 +1108,7 @@ func (l *Log) appendToPublishedEntry(
 
 	// Use OriginalLeafIndex so every late arrival references the first
 	// published leaf, not a previous late-arrival leaf.
-	if staged.OriginalLeafIndex != 0 {
+	if staged.HasOriginalLeafIndex {
 		referencedLeaf = staged.OriginalLeafIndex
 	} else {
 		referencedLeaf = staged.LeafIndex
@@ -1527,8 +1508,28 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 	if wbbEntry.Threshold == 1 {
 		// Threshold-1 entries are verified immediately and then continue
 		// through the normal publication path below.
+		//
+		// PoC patch P7: a single-signer submission carries the single-signer
+		// fields and nothing else. Multi-signer fields here are unverifiable
+		// by this path, so they are refused rather than logged as sent.
+		if len(signedEntry.EntityIDs) > 0 || len(signedEntry.Signatures) > 0 ||
+			len(signedEntry.AggregateSignature) > 0 || len(signedEntry.BLSSignature) > 0 ||
+			len(signedEntry.SignerTimestamps) > 0 {
+			return nil, http.StatusBadRequest, fmtErrorf(
+				"threshold-1 entry carries multi-signer fields")
+		}
 		if err := l.verifySingleWBBEntry(signedEntry, wbbEntry); err != nil {
 			return nil, http.StatusForbidden, err
+		}
+		// Sequence exactly what was verified. Anything else a submitter sent
+		// along would change the logged bytes - and so the leaf - without any
+		// signature covering it, which is how a public entry could be
+		// replayed into a second, unattributable leaf.
+		signedEntry = SignedEntry{
+			Data:      signedEntry.Data,
+			Timestamp: signedEntry.Timestamp,
+			EntityID:  signedEntry.EntityID,
+			Signature: signedEntry.Signature,
 		}
 
 	} else if len(signedEntry.EntityIDs) > 0 || len(signedEntry.AggregateSignature) > 0 {
@@ -1540,6 +1541,16 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 		// request itself.
 		if err := l.verifyAggregateWBBEntry(signedEntry, wbbEntry); err != nil {
 			return nil, http.StatusForbidden, err
+		}
+		// PoC patch P7: as above, only the verified fields are sequenced.
+		signedEntry = SignedEntry{
+			Data:      signedEntry.Data,
+			Timestamp: signedEntry.Timestamp,
+			// What this path verified is a BLS aggregate: the algorithm is
+			// not the submitter's to state.
+			SigAlgorithm:       "bls",
+			EntityIDs:          signedEntry.EntityIDs,
+			AggregateSignature: signedEntry.AggregateSignature,
 		}
 
 		// Continue through the normal immediate publication path below.

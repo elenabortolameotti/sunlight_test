@@ -338,3 +338,152 @@ func TestCheckpointSignatureAlwaysVerifies(t *testing.T) {
 		}
 	}
 }
+
+// A restarted board must still know which threshold entries it has already
+// published, and who signed them. The log serves those signatures to
+// everybody, so if the board forgot, anyone could send a published entry's
+// own signatures back in and open a second round for the same data - a
+// duplicate leaf for a once-only artifact, with no key of their own.
+func TestRestartRefusesReplayOfPublishedThresholdSignatures(t *testing.T) {
+	pubs, privs := pocKeys(t, "PM-1", "RT-1", "RT-2", "RT-3")
+	logKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &ctlog.Config{
+		Name:            "restart.replay.example.com",
+		Key:             logKey,
+		Cache:           filepath.Join(t.TempDir(), "cache.db"),
+		Backend:         NewMemoryBackend(t),
+		Lock:            NewMemoryLockBackend(t),
+		Log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		EntityKeys:      pubs,
+		PhaseManagerKey: pubs["PM-1"],
+		GracePeriod:     50 * time.Millisecond,
+	}
+	if err := ctlog.CreateLog(context.Background(), config); err != nil {
+		t.Fatalf("CreateLog: %v", err)
+	}
+
+	const wbbData = "setup,RT,acc_pub_key,2,pk_data_poc"
+	now := time.Now().UnixMilli()
+	server, stop := runLog(t, config)
+	// Two of the three tellers sign; the third is late (it signs only after
+	// the restart, further down).
+	for _, id := range []string{"RT-1", "RT-2"} {
+		if code, body := pocSubmit(t, server, wbbData, id, now, privs[id]); code != http.StatusOK &&
+			code != http.StatusAccepted {
+			t.Fatalf("%s: %d: %s", id, code, body)
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	entriesOf := func(server *httptest.Server) pocEntriesResponse {
+		t.Helper()
+		code, body, _ := pocGet(t, server.URL+"/entries")
+		if code != http.StatusOK {
+			t.Fatalf("GET /entries: %d", code)
+		}
+		var entries pocEntriesResponse
+		if err := json.Unmarshal(body, &entries); err != nil {
+			t.Fatalf("unmarshal /entries: %v", err)
+		}
+		return entries
+	}
+	published := entriesOf(server)
+	if published.Count != 1 {
+		t.Fatalf("expected 1 published entry, got %d", published.Count)
+	}
+	stop()
+
+	// Restart, then replay the signatures the log itself publishes.
+	server, stop = runLog(t, config)
+	defer stop()
+	for _, id := range []string{"RT-1", "RT-2"} {
+		code, body := pocSubmit(t, server, wbbData, id, now, privs[id])
+		if code != http.StatusConflict {
+			t.Errorf("replay of %s after restart: expected 409, got %d: %s", id, code, body)
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	if after := entriesOf(server); after.Count != 1 {
+		t.Fatalf("the replay created %d extra leaves", after.Count-1)
+	}
+
+	// A signer that never signed is still welcome after the restart: it is
+	// logged as a late co-signature of the entry it signs, not as a new one.
+	code, body := pocSubmit(t, server, wbbData, "RT-3", now+1, privs["RT-3"])
+	if code != http.StatusOK {
+		t.Fatalf("late co-signer after restart: %d: %s", code, body)
+	}
+	time.Sleep(300 * time.Millisecond)
+	entries := entriesOf(server)
+	if entries.Count != 2 {
+		t.Fatalf("expected the original entry plus a late co-signature, got %d", entries.Count)
+	}
+	var late ctlog.SignedEntry
+	if err := json.Unmarshal(entries.Entries[1].Entry, &late); err != nil {
+		t.Fatalf("unmarshal late co-signature: %v", err)
+	}
+	if string(late.Data) != "ref:0" {
+		t.Errorf("late co-signature must reference the ORIGINAL leaf, got %q", late.Data)
+	}
+	if late.EntityID != "RT-3" {
+		t.Errorf("late co-signature signed by %q", late.EntityID)
+	}
+}
+
+// The deduplication cache is a separate file the log can lose (a restore
+// without it, a crash, an operator following upstream advice). Without the
+// cache, a replay of any single-signer leaf the log SERVES - by anyone, no key
+// needed - would be appended a second time: a duplicate of a once-only setup
+// artifact. The cache is therefore reseeded from the log at startup.
+func TestRestartWithoutCacheStillDeduplicates(t *testing.T) {
+	config, privs := restartConfig(t, "restart.cache.example.com")
+	server, stop := runLog(t, config)
+	now := time.Now().UnixMilli()
+	if code, body := pocSubmit(t, server, "setup,ER,election_pub_key,1,pk_data_poc", "ER-1", now, privs["ER-1"]); code != http.StatusOK {
+		t.Fatalf("first submission: %d: %s", code, body)
+	}
+	code, body, _ := pocGet(t, server.URL+"/entries")
+	if code != http.StatusOK {
+		t.Fatalf("GET /entries: %d", code)
+	}
+	var served pocEntriesResponse
+	if err := json.Unmarshal(body, &served); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if served.Count != 1 {
+		t.Fatalf("expected 1 entry, got %d", served.Count)
+	}
+	stop()
+
+	// Lose the cache, keep the log.
+	if err := os.Remove(config.Cache); err != nil {
+		t.Fatalf("remove cache: %v", err)
+	}
+	server, stop = runLog(t, config)
+	defer stop()
+
+	// Replay the leaf exactly as served.
+	resp, err := http.Post(server.URL+"/submit", "application/json", bytes.NewReader(served.Entries[0].Entry))
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("replay: expected 200 (deduplicated), got %d: %s", resp.StatusCode, got)
+	}
+	time.Sleep(300 * time.Millisecond)
+	code, body, _ = pocGet(t, server.URL+"/entries")
+	if code != http.StatusOK {
+		t.Fatalf("GET /entries: %d", code)
+	}
+	var after pocEntriesResponse
+	if err := json.Unmarshal(body, &after); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if after.Count != 1 {
+		t.Fatalf("the replay created %d extra leaves after the cache was lost", after.Count-1)
+	}
+}

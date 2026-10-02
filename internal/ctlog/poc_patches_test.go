@@ -7,6 +7,8 @@ package ctlog_test
 //	P3 grace_period_ms
 //	P4 max_submit_body_bytes
 //	P5 eligible_vids + revocation_commitment policy entry types
+//	P7 only verified fields are sequenced (a public entry cannot be replayed
+//	   into a second leaf by adding an unverified field)
 
 import (
 	"context"
@@ -370,13 +372,33 @@ func TestPoCMaxSubmitBodyBytesDefault(t *testing.T) {
 // --- P5: eligible_vids + revocation_commitment ------------------------------
 
 func TestPoCNewPolicyEntryTypes(t *testing.T) {
-	pubs, privs := pocKeys(t, "PM-1", "ER-1")
+	pubs, privs := pocKeys(t, "PM-1", "ER-1", "BB-1")
 	pmPub := pubs["PM-1"]
 	server := startPoCLog(t, pubs, pmPub, nil)
 
 	now := time.Now().UnixMilli()
 
 	// In setup phase both new types are rejected (wrong phase).
+	// The assigned-id commitment is a SETUP entry of the ER.
+	if code, body := pocSubmit(t, server, "setup,ER,assigned_vids,1,[1;2;3]", "ER-1", now, privs["ER-1"]); code != http.StatusOK {
+		t.Errorf("assigned_vids in setup: expected 200, got %d: %s", code, body)
+	}
+	// The tabulation tellers' public key shares are a SETUP entry of the ER
+	// too; a ballot box may not write them, and not in the voting phase.
+	if code, body := pocSubmit(t, server, "setup,ER,tt_public_shares,1,W10=", "ER-1", now, privs["ER-1"]); code != http.StatusOK {
+		t.Errorf("tt_public_shares in setup: expected 200, got %d: %s", code, body)
+	}
+	if code, body := pocSubmit(t, server, "setup,BB,tt_public_shares,1,W10=", "BB-1", now, privs["BB-1"]); code != http.StatusForbidden {
+		t.Errorf("tt_public_shares by a ballot box: expected 403, got %d: %s", code, body)
+	}
+	// A padded field is refused rather than trimmed: the verifiers that read
+	// the log back trim nothing, so an entry accepted here must parse there.
+	if code, body := pocSubmit(t, server, "setup, ER,assigned_vids,1,[1;2;3]", "ER-1", now, privs["ER-1"]); code == http.StatusOK {
+		t.Errorf("padded role field: expected a refusal, got %d: %s", code, body)
+	}
+	if code, body := pocSubmit(t, server, "setup,ER,assigned_vids, 1,[1;2;3]", "ER-1", now, privs["ER-1"]); code == http.StatusOK {
+		t.Errorf("padded threshold field: expected a refusal, got %d: %s", code, body)
+	}
 	code, body := pocSubmit(t, server, "setup,ER,eligible_vids,1,[1;2;3]", "ER-1", now, privs["ER-1"])
 	if code != http.StatusForbidden {
 		t.Errorf("eligible_vids in setup: expected 403, got %d: %s", code, body)
@@ -412,5 +434,128 @@ func TestPoCNewPolicyEntryTypes(t *testing.T) {
 	code, body = pocSubmit(t, server, "tallying,ER,eligible_vids,1,[1;2;3]", "ER-1", now, privs["ER-1"])
 	if code != http.StatusOK {
 		t.Errorf("eligible_vids in tallying: expected 200, got %d: %s", code, body)
+	}
+}
+
+// The registration tellers, and only they, write the credential control
+// elements, and only during tallying (paper Sec. 3.4.2 / Sec. 3.9 step 19).
+func TestPoCCredentialControlPolicy(t *testing.T) {
+	pubs, privs := pocKeys(t, "PM-1", "RT-1", "RT-2", "TT-1", "ER-1")
+	server := startPoCLog(t, pubs, pubs["PM-1"], func(c *ctlog.Config) {
+		c.GracePeriod = 50 * time.Millisecond
+	})
+	now := time.Now().UnixMilli()
+	control := "tallying,RT,credential_control,2,elements"
+
+	// Not before tallying.
+	if code, body := pocSubmit(t, server, "setup,RT,credential_control,2,elements", "RT-1", now, privs["RT-1"]); code != http.StatusForbidden {
+		t.Fatalf("credential_control in setup: HTTP %d (%s), want 403", code, body)
+	}
+	for _, step := range []string{"setup,PM,phase_transition,1,voting", "voting,PM,phase_transition,1,tallying"} {
+		if code, body := pocSubmit(t, server, step, "PM-1", now, privs["PM-1"]); code != http.StatusOK {
+			t.Fatalf("%s: HTTP %d: %s", step, code, body)
+		}
+	}
+	// Not by another role, and not below the RT threshold.
+	if code, body := pocSubmit(t, server, "tallying,TT,credential_control,3,elements", "TT-1", now, privs["TT-1"]); code != http.StatusForbidden {
+		t.Fatalf("credential_control by a TT: HTTP %d (%s), want 403", code, body)
+	}
+	if code, body := pocSubmit(t, server, "tallying,RT,credential_control,1,elements", "RT-1", now, privs["RT-1"]); code != http.StatusForbidden {
+		t.Fatalf("credential_control with threshold 1: HTTP %d (%s), want 403", code, body)
+	}
+	// Two tellers agreeing on the same data publish it.
+	for _, id := range []string{"RT-1", "RT-2"} {
+		if code, body := pocSubmit(t, server, control, id, now, privs[id]); code != http.StatusOK && code != http.StatusAccepted {
+			t.Fatalf("credential_control by %s: HTTP %d: %s", id, code, body)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, body, _ := pocGet(t, server.URL+"/entries")
+		if strings.Contains(string(body), "credential_control") || time.Now().After(deadline) {
+			if !strings.Contains(string(body), "\"leaf_index\":2") {
+				t.Fatalf("the credential_control entry was not sequenced: %s", body)
+			}
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// --- P7: a submission is logged as verified, not as sent ----------------------
+
+// Anyone can read the log. If unverified fields travelled with an entry into
+// the leaf, anyone could take a published entry, add such a field and submit
+// it again: the signature still verifies, the bytes differ, so the entry would
+// be appended a SECOND time - a duplicate of a once-only artifact, and a leaf
+// no entity can be held to.
+func TestPoCReplayWithUnverifiedFieldIsNotASecondLeaf(t *testing.T) {
+	pubs, privs := pocKeys(t, "ER-1")
+	server := startPoCLog(t, pubs, nil, nil)
+	const wbbData = "setup,ER,election_pub_key,1,pk_data_poc"
+	now := time.Now().UnixMilli()
+
+	if code, body := pocSubmit(t, server, wbbData, "ER-1", now, privs["ER-1"]); code != http.StatusOK {
+		t.Fatalf("first submission: %d: %s", code, body)
+	}
+
+	// The published entry, exactly as the log serves it to everybody.
+	code, body, _ := pocGet(t, server.URL+"/entries")
+	if code != http.StatusOK {
+		t.Fatalf("GET /entries: %d", code)
+	}
+	var entries pocEntriesResponse
+	if err := json.Unmarshal(body, &entries); err != nil {
+		t.Fatalf("unmarshal /entries: %v", err)
+	}
+	if entries.Count != 1 {
+		t.Fatalf("expected 1 entry, got %d", entries.Count)
+	}
+	var published map[string]json.RawMessage
+	if err := json.Unmarshal(entries.Entries[0].Entry, &published); err != nil {
+		t.Fatalf("unmarshal published entry: %v", err)
+	}
+
+	// Replay it with one extra field the single-signer path does not verify.
+	for _, extra := range []struct {
+		field string
+		value string
+		want  int
+	}{
+		{"sig_algorithm", `"ed25519"`, http.StatusOK},     // ignored: same leaf
+		{"entity_ids", `["ER-2"]`, http.StatusBadRequest}, // refused outright
+		{"signatures", `["AAAA"]`, http.StatusBadRequest}, // refused outright
+		{"signer_timestamps", `[]`, http.StatusOK},        // empty: nothing added
+	} {
+		replay := make(map[string]json.RawMessage, len(published)+1)
+		for k, v := range published {
+			replay[k] = v
+		}
+		replay[extra.field] = json.RawMessage(extra.value)
+		raw, err := json.Marshal(replay)
+		if err != nil {
+			t.Fatalf("marshal replay: %v", err)
+		}
+		resp, err := http.Post(server.URL+"/submit", "application/json", strings.NewReader(string(raw)))
+		if err != nil {
+			t.Fatalf("submit replay: %v", err)
+		}
+		got, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != extra.want {
+			t.Errorf("replay with %s: expected %d, got %d: %s",
+				extra.field, extra.want, resp.StatusCode, got)
+		}
+
+		code, body, _ = pocGet(t, server.URL+"/entries")
+		if code != http.StatusOK {
+			t.Fatalf("GET /entries: %d", code)
+		}
+		if err := json.Unmarshal(body, &entries); err != nil {
+			t.Fatalf("unmarshal /entries: %v", err)
+		}
+		if entries.Count != 1 {
+			t.Fatalf("replay with %s created a second leaf: %d entries", extra.field, entries.Count)
+		}
 	}
 }

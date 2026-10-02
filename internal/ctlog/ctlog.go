@@ -21,6 +21,7 @@ import (
 	"maps"
 	"math/big"
 	mathrand "math/rand/v2"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -146,6 +147,10 @@ type StagingEntry struct {
 
 	IsPublished bool
 	LeafIndex   int64
+
+	// HasOriginalLeafIndex tells OriginalLeafIndex apart from an entry
+	// published at leaf 0 (leaf 0 is a valid index, not "unset").
+	HasOriginalLeafIndex bool
 
 	// OriginalLeafIndex is the leaf index of the first publication.
 	// Unlike LeafIndex, this is never updated by late arrivals, so every
@@ -475,6 +480,10 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 	// phase_transition so a restarted board resumes in the phase it had
 	// reached instead of falling back to setup (phases only move forward).
 	l.replayPhaseTransitions()
+	l.replayPublishedStaging()
+	if err := l.reseedCache(); err != nil {
+		return nil, fmt.Errorf("couldn't reseed the deduplication cache from the log: %w", err)
+	}
 	return l, nil
 }
 
@@ -539,6 +548,91 @@ func (l *Log) replayPhaseTransitions() {
 			continue
 		}
 		l.applyPhaseTransitionIfNeeded(wbbEntry)
+	}
+}
+
+// replayPublishedStaging rebuilds, from the log itself, the record of which
+// threshold entries are already published and who signed them.
+//
+// A published entry therefore STAYS in the staging map for the life of the
+// process: it is what lets the board recognise a replay. (An earlier
+// per-phase cleanup of published staging entries would have reopened exactly
+// that hole and was removed.)
+//
+// Staging lives in memory: without this, a restart would forget it, and the
+// signatures of a published threshold entry - which the log serves to
+// everybody - could be sent back in to open a SECOND round for the same data
+// and sequence a duplicate leaf. Anyone who can read the log could do that,
+// with no key of their own.
+func (l *Log) replayPublishedStaging() {
+	byLeafIndex := make(map[int64]*StagingEntry, len(l.entries))
+	for i := range l.entries {
+		var signed SignedEntry
+		if err := json.Unmarshal(l.entries[i].Entry, &signed); err != nil {
+			continue
+		}
+		data := string(signed.Data)
+
+		// A co-signature that arrived after publication: `ref:N` carries a
+		// signature over the data of leaf N.
+		if ref, ok := strings.CutPrefix(data, "ref:"); ok {
+			index, err := strconv.ParseInt(strings.TrimSpace(ref), 10, 64)
+			if err != nil {
+				continue
+			}
+			if staged, ok := byLeafIndex[index]; ok && signed.EntityID != "" {
+				staged.Submissions[signed.EntityID] = &StagingSubmission{
+					EntityID:     signed.EntityID,
+					Timestamp:    signed.Timestamp,
+					Signature:    signed.Signature,
+					BLSSignature: signed.BLSSignature,
+				}
+				if signed.Timestamp > staged.LastSubmissionAt {
+					staged.LastSubmissionAt = signed.Timestamp
+				}
+			}
+			continue
+		}
+
+		wbbEntry, err := ParseWBBEntry(data)
+		if err != nil || wbbEntry.Threshold <= 1 {
+			continue
+		}
+		staged := &StagingEntry{
+			WBBData:              data,
+			Phase:                wbbEntry.Phase,
+			Role:                 wbbEntry.Role,
+			EntryType:            wbbEntry.EntryType,
+			Threshold:            wbbEntry.Threshold,
+			Content:              wbbEntry.Content,
+			SigAlgorithm:         signed.SigAlgorithm,
+			Submissions:          make(map[string]*StagingSubmission),
+			FirstSubmissionAt:    signed.Timestamp,
+			LastSubmissionAt:     signed.Timestamp,
+			IsPublished:          true,
+			LeafIndex:            l.entries[i].LeafIndex,
+			OriginalLeafIndex:    l.entries[i].LeafIndex,
+			HasOriginalLeafIndex: true,
+		}
+		perSigner := make(map[string]int64, len(signed.SignerTimestamps))
+		for _, t := range signed.SignerTimestamps {
+			perSigner[t.EntityID] = t.Timestamp
+		}
+		// A BLS entry keeps only the aggregate, so that is what a further
+		// signer must be aggregated onto.
+		staged.RunningBLSAggregate = signed.AggregateSignature
+		for j, id := range signed.EntityIDs {
+			submission := &StagingSubmission{EntityID: id, Timestamp: signed.Timestamp}
+			if ts, ok := perSigner[id]; ok {
+				submission.Timestamp = ts
+			}
+			if j < len(signed.Signatures) {
+				submission.Signature = signed.Signatures[j]
+			}
+			staged.Submissions[id] = submission
+		}
+		l.staging[computeContentHash(data)] = staged
+		byLeafIndex[l.entries[i].LeafIndex] = staged
 	}
 }
 
@@ -693,6 +787,7 @@ func (l *Log) addLeafToPool(ctx context.Context, leaf *PendingLogEntry) (f waitE
 	if f, ok := l.inSequencing[h]; ok {
 		return f, "pool"
 	}
+
 	if leafEntry, err := l.cacheGet(leaf.Data); err != nil {
 		return func(ctx context.Context) (*sunlight.LogEntry, error) {
 			return nil, fmtErrorf("deduplication cache get failed: %w", err)

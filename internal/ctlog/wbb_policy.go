@@ -39,12 +39,23 @@ const (
 
 	EntryPhaseTransition EntryType = "phase_transition"
 
-	// PoC extensions (referendum PoC roadmap, patch P5):
+	// PoC extensions:
 	// the ER publishes the eligible-voter pseudonymous id list at the start
 	// of tallying (paper §3.9 step 1), and commitments to ACC revocation
 	// requests during the voting phase (paper §3.7.5).
 	EntryEligibleVids         EntryType = "eligible_vids"
 	EntryRevocationCommitment EntryType = "revocation_commitment"
+	// The pseudonymous ids assigned to the registered voters, committed by
+	// the ER at setup: the tally-time eligible list is audited against it.
+	EntryAssignedVids EntryType = "assigned_vids"
+	// The tabulation tellers' public key shares, published by the ER at
+	// setup from the ceremony's output: every threshold decryption is held
+	// to them, teller by teller.
+	EntryTtPublicShares EntryType = "tt_public_shares"
+
+	// The registration tellers write the credential control elements during
+	// tallying (paper Sec. 3.4.2, tallying phase; Sec. 3.9 step 19).
+	EntryCredentialControl EntryType = "credential_control"
 )
 
 const (
@@ -61,23 +72,34 @@ type WBBEntry struct {
 	Content   string
 }
 
+// ParseWBBEntry splits a data string into its five fields. It is at least
+// as strict as the verifiers that read the log back (the auditor and the
+// apps split on the first four commas and trim nothing): a field padded
+// with whitespace is refused here rather than accepted and then invisible
+// to every verifier; a content field with a comma in it is refused too
+// (payloads are base64).
 func ParseWBBEntry(s string) (WBBEntry, error) {
 	parts := strings.Split(s, ",")
 	if len(parts) != 5 {
 		return WBBEntry{}, fmt.Errorf("invalid WBB entry: expected 5 comma-separated fields, got %d", len(parts))
 	}
+	for i, part := range parts[:4] {
+		if part != strings.TrimSpace(part) || part == "" {
+			return WBBEntry{}, fmt.Errorf("invalid WBB entry: field %d %q is empty or padded", i+1, part)
+		}
+	}
 
-	threshold, err := strconv.Atoi(strings.TrimSpace(parts[3]))
+	threshold, err := strconv.Atoi(parts[3])
 	if err != nil {
-		return WBBEntry{}, fmt.Errorf("invalid WBB entry: threshold %q is not an integer", strings.TrimSpace(parts[3]))
+		return WBBEntry{}, fmt.Errorf("invalid WBB entry: threshold %q is not an integer", parts[3])
 	}
 
 	return WBBEntry{
-		Phase:     Phase(strings.TrimSpace(parts[0])),
-		Role:      Role(strings.TrimSpace(parts[1])),
-		EntryType: EntryType(strings.TrimSpace(parts[2])),
+		Phase:     Phase(parts[0]),
+		Role:      Role(parts[1]),
+		EntryType: EntryType(parts[2]),
 		Threshold: threshold,
-		Content:   strings.TrimSpace(parts[4]),
+		Content:   parts[4],
 	}, nil
 }
 
@@ -101,6 +123,14 @@ func CheckWBBWritePolicy(s string) (bool, error) {
 	}
 
 	if phase == PhaseSetup && role == RoleER && entryType == EntryPseudonymousIDCount && threshold >= ThresholdOne {
+		return true, nil
+	}
+
+	if phase == PhaseSetup && role == RoleER && entryType == EntryAssignedVids && threshold >= ThresholdOne {
+		return true, nil
+	}
+
+	if phase == PhaseSetup && role == RoleER && entryType == EntryTtPublicShares && threshold >= ThresholdOne {
 		return true, nil
 	}
 
@@ -137,6 +167,12 @@ func CheckWBBWritePolicy(s string) (bool, error) {
 	}
 
 	if phase == PhaseTallying && role == RoleTT && entryType == EntryTallyProof && threshold >= ThresholdTT {
+		return true, nil
+	}
+
+	// Paper Sec. 3.4.2: "t_RT RTs which agree on the same data can write the
+	// credential control elements" during tallying.
+	if phase == PhaseTallying && role == RoleRT && entryType == EntryCredentialControl && threshold >= ThresholdRT {
 		return true, nil
 	}
 

@@ -201,9 +201,20 @@ The Tuscolo public configs include [an example of how to schedule it with system
 Referendum PoC additions (branch `referendum-poc-wbb`), on top of the WBB
 policy/staging/phase-manager work:
 
-- **Read API** (`GET /entries`, `GET /entries/{index}`, `GET /phase`,
-  `GET /checkpoint`), deterministic sequencing mode, configurable grace period
-  and submit body cap, extra policy entry types.
+- **Read API** (`GET /entries`, `GET /entries?start=N` for the leaves from
+  N on, so a reader that keeps what it read fetches only what was written
+  since; `GET /entries/{index}`, `GET /phase`, `GET /checkpoint`; leaf
+  lookups by binary search), deterministic sequencing mode, configurable
+  grace period and submit body cap, extra policy entry types.
+- **Per-writer bounds**: each entity may hold an equal share of a sequencing
+  pool (`poolsize` / number of entities), so one writer submitting as fast
+  as it can never fills the pool for the others; and at most 64 staged
+  co-signed entries that are not yet published, and four times the largest
+  submission in bytes. A writer at either bound is answered 503 with a
+  message naming the bound, not "server busy". A ballot box's entries must
+  declare threshold 1 (they are its own statements), so they are never
+  staged. A co-signed entry already in the pool is not rolled back when the
+  request that completed it is cut off.
 - **Validators** (`validator_bls_keys` per-log config, `POST /validations`,
   `cmd/wbb-validator`): independent parties that fetch the signed checkpoint,
   verify the log's signature, rebuild the Merkle tree from the published

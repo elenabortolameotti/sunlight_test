@@ -11,11 +11,16 @@ import (
 
 var ErrEvicted = errEvicted
 var ErrPoolFull = errPoolFull
+var ErrWriterShareFull = errWriterShareFull
 
 type WaitEntryFunc = waitEntryFunc
 
 func (l *Log) AddLeafToPool(e *PendingLogEntry) (WaitEntryFunc, string) {
-	return l.addLeafToPool(context.Background(), e)
+	return l.addLeafToPool(context.Background(), e, "")
+}
+
+func (l *Log) AddLeafToPoolAs(e *PendingLogEntry, writer string) (WaitEntryFunc, string) {
+	return l.addLeafToPool(context.Background(), e, writer)
 }
 
 func (l *Log) Sequence() error {
@@ -55,4 +60,20 @@ func CheckpointVerifierForTest(name string, key *ecdsa.PrivateKey) (note.Verifie
 		return nil, err
 	}
 	return signer.(*ecdsaSigner).Verifier(), nil
+}
+
+// StagingLenForTest is how many entries the staging map holds.
+func (l *Log) StagingLenForTest() int {
+	l.stagingMu.Lock()
+	defer l.stagingMu.Unlock()
+	return len(l.staging)
+}
+
+const MaxPendingPerWriter = maxPendingPerWriter
+
+// WriterPendingForTest is writerPendingLocked for one writer.
+func (l *Log) WriterPendingForTest(id string) (int, int) {
+	l.stagingMu.Lock()
+	defer l.stagingMu.Unlock()
+	return l.writerPendingLocked(id)
 }

@@ -17,6 +17,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -51,6 +52,13 @@ func pocKeys(t *testing.T, ids ...string) (map[string]ed25519.PublicKey, map[str
 // startPoCLog creates a log, serves its handler over httptest, and runs a
 // fast background sequencer (the submit handler blocks until sequencing).
 func startPoCLog(t *testing.T, entityKeys map[string]ed25519.PublicKey, pmKey ed25519.PublicKey, tune func(*ctlog.Config)) *httptest.Server {
+	t.Helper()
+	server, _ := startPoCLogWithLog(t, entityKeys, pmKey, tune)
+	return server
+}
+
+// startPoCLogWithLog is startPoCLog, also returning the log itself.
+func startPoCLogWithLog(t *testing.T, entityKeys map[string]ed25519.PublicKey, pmKey ed25519.PublicKey, tune func(*ctlog.Config)) (*httptest.Server, *ctlog.Log) {
 	t.Helper()
 
 	logKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -109,7 +117,7 @@ func startPoCLog(t *testing.T, entityKeys map[string]ed25519.PublicKey, pmKey ed
 		}
 	}()
 
-	return server
+	return server, log
 }
 
 func pocSubmit(t *testing.T, server *httptest.Server, wbbData, entityID string, ts int64, priv ed25519.PrivateKey) (int, []byte) {
@@ -210,6 +218,30 @@ func TestPoCReadAPI(t *testing.T) {
 	}
 	if !strings.Contains(string(signedSingle.Data), "beta") {
 		t.Errorf("expected entry 1 to contain %q, got %q", "beta", signedSingle.Data)
+	}
+
+	// GET /entries?start=1 serves the leaves from leaf 1 on; past the end,
+	// none; a start that is not a leaf index is refused.
+	code, body, _ = pocGet(t, server.URL+"/entries?start=1")
+	if code != http.StatusOK {
+		t.Fatalf("GET /entries?start=1: expected 200, got %d", code)
+	}
+	var from1 pocEntriesResponse
+	if err := json.Unmarshal(body, &from1); err != nil {
+		t.Fatalf("unmarshal /entries?start=1: %v", err)
+	}
+	if len(from1.Entries) != 1 || from1.Entries[0].LeafIndex != 1 {
+		t.Fatalf("GET /entries?start=1: expected leaf 1 alone, got %s", body)
+	}
+	code, body, _ = pocGet(t, server.URL+"/entries?start=2")
+	var past pocEntriesResponse
+	if err := json.Unmarshal(body, &past); code != http.StatusOK || err != nil || len(past.Entries) != 0 {
+		t.Fatalf("GET /entries?start=2: expected no entries, got %d %s", code, body)
+	}
+	for _, bad := range []string{"-1", "x"} {
+		if code, _, _ := pocGet(t, server.URL+"/entries?start="+bad); code != http.StatusBadRequest {
+			t.Errorf("GET /entries?start=%s: expected 400, got %d", bad, code)
+		}
 	}
 
 	// GET /entries/99 → 404; GET /entries/-1 → 400
@@ -557,5 +589,145 @@ func TestPoCReplayWithUnverifiedFieldIsNotASecondLeaf(t *testing.T) {
 		if entries.Count != 1 {
 			t.Fatalf("replay with %s created a second leaf: %d entries", extra.field, entries.Count)
 		}
+	}
+}
+
+// --- writer's share of the pool ---------------------------------------------
+
+// One writer submitting as fast as it can fills its own share of the pool
+// and no more: another writer's leaf still finds room in the same pool.
+func TestPoCWriterPoolShare(t *testing.T) {
+	pubs, _ := pocKeys(t, "BB-1", "BB-2")
+	logKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &ctlog.Config{
+		Name:       "test.poc.example.com",
+		Key:        logKey,
+		PoolSize:   4,
+		Cache:      filepath.Join(t.TempDir(), "cache.db"),
+		Backend:    NewMemoryBackend(t),
+		Lock:       NewMemoryLockBackend(t),
+		Log:        slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		EntityKeys: pubs,
+	}
+	ctx := context.Background()
+	if err := ctlog.CreateLog(ctx, config); err != nil {
+		t.Fatalf("CreateLog: %v", err)
+	}
+	log, err := ctlog.LoadLog(ctx, config)
+	if err != nil {
+		t.Fatalf("LoadLog: %v", err)
+	}
+	t.Cleanup(func() { log.CloseCache() })
+
+	leaf := func(n int) *ctlog.PendingLogEntry {
+		return &ctlog.PendingLogEntry{Data: []byte(fmt.Sprintf("leaf %d", n))}
+	}
+	// Two entities, a pool of 4: a share of 2 each.
+	for n := 0; n < 2; n++ {
+		if _, source := log.AddLeafToPoolAs(leaf(n), "BB-2"); source != "sequencer" {
+			t.Fatalf("BB-2 leaf %d within its share: got %q", n, source)
+		}
+	}
+	wait, source := log.AddLeafToPoolAs(leaf(2), "BB-2")
+	if source != "ratelimit" {
+		t.Fatalf("BB-2 past its share: expected ratelimit, got %q", source)
+	}
+	if _, err := wait(ctx); err != ctlog.ErrWriterShareFull {
+		t.Fatalf("BB-2 past its share: expected ErrWriterShareFull, got %v", err)
+	}
+	if _, source := log.AddLeafToPoolAs(leaf(3), "BB-1"); source != "sequencer" {
+		t.Fatalf("BB-1 while BB-2 is at its share: got %q", source)
+	}
+	if err := log.Sequence(); err != nil {
+		t.Fatalf("Sequence: %v", err)
+	}
+	// A new pool, a new share.
+	if _, source := log.AddLeafToPoolAs(leaf(4), "BB-2"); source != "sequencer" {
+		t.Fatalf("BB-2 in the next pool: got %q", source)
+	}
+}
+
+// --- staged entries that never complete -------------------------------------
+
+// A ballot box's entry is its own statement: one that declares a threshold
+// above 1 is refused, never staged to wait for co-signers that will not come.
+func TestPoCBallotBoxEntriesAreSingleSigned(t *testing.T) {
+	pubs, privs := pocKeys(t, "BB-1", "BB-2")
+	server, log := startPoCLogWithLog(t, pubs, nil, nil)
+	now := time.Now().UnixMilli()
+	for _, data := range []string{
+		"voting,BB,ballot_digest,2,junk",
+		"voting,BB,ballot_metadata,2,junk",
+		"voting,BB,cast_intended_proof,2,junk",
+		"tallying,BB,encrypted_ballot,2,junk",
+	} {
+		if code, body := pocSubmit(t, server, data, "BB-2", now, privs["BB-2"]); code != http.StatusForbidden {
+			t.Errorf("%s: expected 403, got %d: %s", data, code, body)
+		}
+	}
+	if n := log.StagingLenForTest(); n != 0 {
+		t.Errorf("expected nothing staged, got %d", n)
+	}
+	if code, body := pocSubmit(t, server, "voting,BB,ballot_digest,1,ok", "BB-2", now+1, privs["BB-2"]); code != http.StatusOK {
+		t.Fatalf("threshold-1 ballot_digest: expected 200, got %d: %s", code, body)
+	}
+}
+
+// One writer may hold only a bounded number of staged entries that are not
+// published: a teller staging entries its co-signers never complete cannot
+// grow the board's memory without limit. An entry that completes frees its
+// place.
+func TestPoCPendingStagingIsBoundedPerWriter(t *testing.T) {
+	pubs, privs := pocKeys(t, "RT-1", "RT-2")
+	server, log := startPoCLogWithLog(t, pubs, nil, nil)
+	now := time.Now().UnixMilli()
+	control := func(i int) string { return fmt.Sprintf("tallying,RT,credential_control,2,junk-%d", i) }
+	for i := 0; i < ctlog.MaxPendingPerWriter; i++ {
+		if code, body := pocSubmit(t, server, control(i), "RT-1", now, privs["RT-1"]); code != http.StatusAccepted {
+			t.Fatalf("pending entry %d: expected 202, got %d: %s", i, code, body)
+		}
+	}
+	over := ctlog.MaxPendingPerWriter
+	if code, body := pocSubmit(t, server, control(over), "RT-1", now, privs["RT-1"]); code != http.StatusServiceUnavailable ||
+		!strings.Contains(string(body), "waiting for co-signers") {
+		t.Fatalf("entry past the bound: expected 503 naming the bound, got %d: %s", code, body)
+	}
+	if n := log.StagingLenForTest(); n != ctlog.MaxPendingPerWriter {
+		t.Fatalf("expected %d staged, got %d", ctlog.MaxPendingPerWriter, n)
+	}
+	// RT-2 completes one of them: published, and RT-1 has a place again.
+	if code, body := pocSubmit(t, server, control(0), "RT-2", now, privs["RT-2"]); code != http.StatusOK {
+		t.Fatalf("completing entry 0: expected 200, got %d: %s", code, body)
+	}
+	if code, body := pocSubmit(t, server, control(over), "RT-1", now, privs["RT-1"]); code != http.StatusAccepted {
+		t.Fatalf("after one completed: expected 202, got %d: %s", code, body)
+	}
+}
+
+// The bound also covers the bytes a writer's pending entries hold: four
+// times the largest submission the log accepts.
+func TestPoCPendingStagingBytesAreBoundedPerWriter(t *testing.T) {
+	pubs, privs := pocKeys(t, "RT-1", "RT-2")
+	server, _ := startPoCLogWithLog(t, pubs, nil, nil)
+	now := time.Now().UnixMilli()
+	big := strings.Repeat("x", 60*1024)
+	accepted := 0
+	for i := 0; i < 20; i++ {
+		data := fmt.Sprintf("tallying,RT,credential_control,2,%d-%s", i, big)
+		code, body := pocSubmit(t, server, data, "RT-1", now, privs["RT-1"])
+		if code == http.StatusServiceUnavailable {
+			break
+		}
+		if code != http.StatusAccepted {
+			t.Fatalf("pending entry %d: expected 202 or 503, got %d: %s", i, code, body)
+		}
+		accepted++
+	}
+	// 128 KiB default body cap: 512 KiB of pending data, eight 60 KiB entries.
+	if accepted != 8 {
+		t.Fatalf("expected 8 pending 60 KiB entries before the byte bound, got %d", accepted)
 	}
 }

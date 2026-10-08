@@ -123,12 +123,25 @@ func setReadCORS(rw http.ResponseWriter) {
 
 // getEntries serves the in-memory index of leaves sequenced by this process:
 // {"count": N, "entries": [{leaf_index, timestamp, entry, leaf_hash,
-// validations, aggregate_signature}, ...], "validators": [ids]}.
+// validations, aggregate_signature}, ...], "validators": [ids]}. With
+// ?start=S, only the leaves from leaf S on: a reader that keeps what it read
+// asks for what was written since, and a reading costs the log that much,
+// not its whole length.
 func (l *Log) getEntries(rw http.ResponseWriter, r *http.Request) {
 	setReadCORS(rw)
+	var start int64
+	if s := r.URL.Query().Get("start"); s != "" {
+		v, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || v < 0 {
+			http.Error(rw, "invalid start", http.StatusBadRequest)
+			return
+		}
+		start = v
+	}
 	l.entriesMu.RLock()
-	entries := make([]ValidatedEntry, 0, len(l.entries))
-	for i := range l.entries {
+	from := l.entryPositionLocked(start)
+	entries := make([]ValidatedEntry, 0, len(l.entries)-from)
+	for i := from; i < len(l.entries); i++ {
 		entries = append(entries, l.validatedEntryLocked(&l.entries[i]))
 	}
 	validators := l.validatorIDsLocked()
@@ -139,6 +152,16 @@ func (l *Log) getEntries(rw http.ResponseWriter, r *http.Request) {
 		"count":      len(entries),
 		"entries":    entries,
 		"validators": validators,
+	})
+}
+
+// entryPositionLocked is the position in l.entries of the first leaf at or
+// after index. The entries are kept in leaf order (each pool is appended as
+// it is sequenced), so one binary search finds a leaf however long the log
+// is. Caller holds entriesMu (read).
+func (l *Log) entryPositionLocked(index int64) int {
+	return sort.Search(len(l.entries), func(i int) bool {
+		return l.entries[i].LeafIndex >= index
 	})
 }
 
@@ -210,12 +233,9 @@ func (l *Log) submitValidation(rw http.ResponseWriter, r *http.Request) {
 	l.entriesMu.RLock()
 	pubKey, known := l.validatorKeys[req.ValidatorID]
 	var entry *SequencedEntry
-	for i := range l.entries {
-		if l.entries[i].LeafIndex == req.LeafIndex {
-			e := l.entries[i]
-			entry = &e
-			break
-		}
+	if i := l.entryPositionLocked(req.LeafIndex); i < len(l.entries) && l.entries[i].LeafIndex == req.LeafIndex {
+		e := l.entries[i]
+		entry = &e
 	}
 	l.entriesMu.RUnlock()
 
@@ -274,12 +294,9 @@ func (l *Log) getEntryByIndex(rw http.ResponseWriter, r *http.Request) {
 
 	l.entriesMu.RLock()
 	var found *ValidatedEntry
-	for i := range l.entries {
-		if l.entries[i].LeafIndex == index {
-			e := l.validatedEntryLocked(&l.entries[i])
-			found = &e
-			break
-		}
+	if i := l.entryPositionLocked(index); i < len(l.entries) && l.entries[i].LeafIndex == index {
+		e := l.validatedEntryLocked(&l.entries[i])
+		found = &e
 	}
 	l.entriesMu.RUnlock()
 
@@ -328,6 +345,12 @@ func (l *Log) submit(rw http.ResponseWriter, r *http.Request) {
 	rsp, code, err := l.submitEntry(r.Context(), r.Body)
 	if err != nil {
 		l.c.Log.DebugContext(r.Context(), "submit error", "code", code, "err", err)
+		// A writer at its staging bound or its share of the pool is told so:
+		// it is not the log that is busy, and the bound is its own.
+		if errors.Is(err, errStagingFull) || errors.Is(err, errWriterShareFull) {
+			http.Error(rw, err.Error(), code)
+			return
+		}
 		if code == http.StatusServiceUnavailable {
 			rw.Header().Set("Retry-After", fmt.Sprintf("%d", 30+rand.Intn(60)))
 			http.Error(rw, "server busy, please retry later", code)
@@ -527,6 +550,40 @@ func stagedSigners(staged *StagingEntry) []string {
 	return signers
 }
 
+// maxPendingPerWriter is how many staged entries one writer may hold that are
+// not published yet (PoC). An honest authority co-signs one entry at a time
+// and waits for it; a few more can be left by runs cut off before their
+// threshold, and a re-run completes those rather than adding new ones.
+const maxPendingPerWriter = 64
+
+var errStagingFull = fmtErrorf("this writer already holds the most co-signed entries the log keeps waiting for co-signers")
+
+// pendingBytesCap is how many bytes of not-yet-published staged data one
+// writer may hold: four times the largest submission the log accepts.
+func (l *Log) pendingBytesCap() int {
+	maxBody := l.c.MaxSubmitBodyBytes
+	if maxBody <= 0 {
+		maxBody = 128 * 1024
+	}
+	return int(4 * maxBody)
+}
+
+// writerPendingLocked counts the staged entries that are not published yet
+// and hold a submission from entityID, and the bytes of their data. Caller
+// holds stagingMu.
+func (l *Log) writerPendingLocked(entityID string) (count, bytes int) {
+	for _, staged := range l.staging {
+		if staged.IsPublished {
+			continue
+		}
+		if _, ok := staged.Submissions[entityID]; ok {
+			count++
+			bytes += len(staged.WBBData)
+		}
+	}
+	return count, bytes
+}
+
 func (l *Log) stageSubmission(contentHash [32]byte, signedEntry SignedEntry, wbbEntry WBBEntry) (currentCount int, isNew bool, err error) {
 	// A staged submission must come from exactly one entity.
 	if signedEntry.EntityID == "" {
@@ -652,6 +709,18 @@ func (l *Log) stageSubmission(contentHash [32]byte, signedEntry SignedEntry, wbb
 	// The same signer must not be counted twice.
 	if _, exists := staged.Submissions[signedEntry.EntityID]; exists {
 		return len(staged.Submissions), false, fmtErrorf("duplicate signer: %s", signedEntry.EntityID)
+	}
+
+	// One writer may hold only so many staged entries that are not published
+	// yet (PoC). An entry that never reaches its threshold is never sequenced,
+	// so neither the pool share nor the log bounds it: without this, one
+	// authority could grow the board's memory without limit, unseen on the log.
+	if count, size := l.writerPendingLocked(signedEntry.EntityID); count >= maxPendingPerWriter ||
+		size+len(signedEntry.Data) > l.pendingBytesCap() {
+		if isNew {
+			delete(l.staging, contentHash)
+		}
+		return len(staged.Submissions), false, errStagingFull
 	}
 
 	// Add the verified submission.
@@ -915,8 +984,13 @@ func (l *Log) finalizeEntry(contentHash [32]byte, ctx context.Context) (leafInde
 
 	e := &PendingLogEntry{Data: entryBytes}
 
-	waitLeaf, _ := l.addLeafToPool(ctx, e)
-	seq, err := waitLeaf(ctx)
+	// A co-signed entry: no single writer made it reach its threshold. Once
+	// it is in the pool it will be sequenced whatever happens to the request
+	// that completed it, so the wait does not end with that request: a cut
+	// connection must not roll back an entry that is about to be published
+	// (it would stay "pending" against every co-signer's staging bound).
+	waitLeaf, _ := l.addLeafToPool(ctx, e, "")
+	seq, err := waitLeaf(context.WithoutCancel(ctx))
 	if err != nil {
 		// Publishing failed. Roll back the publishing marker so the entry can
 		// be retried later.
@@ -927,7 +1001,7 @@ func (l *Log) finalizeEntry(contentHash [32]byte, ctx context.Context) (leafInde
 		}
 		l.stagingMu.Unlock()
 
-		if err == errPoolFull || err == errEvicted {
+		if err == errPoolFull || err == errWriterShareFull || err == errEvicted {
 			return 0, err
 		}
 		if errors.As(err, new(SunsetLogError)) {
@@ -1177,8 +1251,8 @@ func (l *Log) appendToPublishedEntry(
 
 	e := &PendingLogEntry{Data: entryBytes}
 
-	waitLeaf, _ := l.addLeafToPool(ctx, e)
-	seq, err := waitLeaf(ctx)
+	waitLeaf, _ := l.addLeafToPool(ctx, e, entityID)
+	seq, err := waitLeaf(context.WithoutCancel(ctx))
 	if err != nil {
 		l.stagingMu.Lock()
 		if staged, ok := l.staging[contentHash]; ok {
@@ -1188,7 +1262,7 @@ func (l *Log) appendToPublishedEntry(
 		}
 		l.stagingMu.Unlock()
 
-		if err == errPoolFull || err == errEvicted {
+		if err == errPoolFull || err == errWriterShareFull || err == errEvicted {
 			return 0, 0, 0, err
 		}
 		if errors.As(err, new(SunsetLogError)) {
@@ -1404,6 +1478,10 @@ func (l *Log) makeAppendedResponse(contentHash [32]byte, referencedLeaf int64, n
 func statusCodeForStagingError(err error, fallback int) int {
 	if err == nil {
 		return fallback
+	}
+
+	if err == errStagingFull {
+		return http.StatusServiceUnavailable
 	}
 
 	errMsg := err.Error()
@@ -1678,7 +1756,7 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 
 	e := &PendingLogEntry{Data: entryBytes}
 
-	waitLeaf, source := l.addLeafToPool(ctx, e)
+	waitLeaf, source := l.addLeafToPool(ctx, e, signedEntry.EntityID)
 	labels["source"] = source
 	waitTimer := prometheus.NewTimer(l.m.AddChainWait)
 	seq, err := waitLeaf(ctx)
@@ -1688,7 +1766,7 @@ func (l *Log) submitEntry(ctx context.Context, reqBody io.ReadCloser) (response 
 	if err == errEvicted {
 		labels["source"] = "evicted"
 	}
-	if err == errPoolFull || err == errEvicted {
+	if err == errPoolFull || err == errWriterShareFull || err == errEvicted {
 		return nil, http.StatusServiceUnavailable, err
 	} else if errors.As(err, new(SunsetLogError)) {
 		return nil, http.StatusGone, err

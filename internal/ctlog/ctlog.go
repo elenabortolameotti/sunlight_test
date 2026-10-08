@@ -749,8 +749,10 @@ func computeCacheHash(data []byte) cacheHash {
 }
 
 type pool struct {
-	pendingLeaves  []*PendingLogEntry
-	byHash         map[cacheHash]waitEntryFunc
+	pendingLeaves []*PendingLogEntry
+	byHash        map[cacheHash]waitEntryFunc
+	// byWriter counts the leaves each writer put in this pool (PoC).
+	byWriter       map[string]int
 	lowPriority    map[int]func()
 	done           chan struct{}
 	err            error
@@ -764,14 +766,29 @@ func newPool() *pool {
 	return &pool{
 		done:        make(chan struct{}),
 		byHash:      make(map[cacheHash]waitEntryFunc),
+		byWriter:    make(map[string]int),
 		lowPriority: make(map[int]func()),
 	}
 }
 
+// writerPoolShare is how many leaves one writer may put in a pool: an equal
+// share of PoolSize per entity the log knows (PoC). One writer submitting as
+// fast as it can then fills its own share and no more, and every other
+// writer still finds room: without it, a single authorized writer could
+// keep the pool full and have everyone else's submissions refused.
+func (l *Log) writerPoolShare() int {
+	share := l.c.PoolSize / max(1, len(l.entityKeys))
+	return max(1, share)
+}
+
 var errPoolFull = fmtErrorf("rate limited")
+var errWriterShareFull = fmtErrorf("this writer already holds its full share of the current sequencing pool")
 var errEvicted = fmtErrorf("evicted to make way for higher priority leaves")
 
-func (l *Log) addLeafToPool(ctx context.Context, leaf *PendingLogEntry) (f waitEntryFunc, source string) {
+// addLeafToPool adds a leaf written by writer (an entity id; "" for a leaf
+// no single writer can make, such as a co-signed entry reaching its
+// threshold) to the current pool.
+func (l *Log) addLeafToPool(ctx context.Context, leaf *PendingLogEntry, writer string) (f waitEntryFunc, source string) {
 	l.poolMu.Lock()
 	defer l.poolMu.Unlock()
 	p := l.currentPool
@@ -803,7 +820,15 @@ func (l *Log) addLeafToPool(ctx context.Context, leaf *PendingLogEntry) (f waitE
 			return nil, errPoolFull
 		}, "ratelimit"
 	}
+	if writer != "" && l.c.PoolSize > 0 && p.byWriter[writer] >= l.writerPoolShare() {
+		return func(ctx context.Context) (*sunlight.LogEntry, error) {
+			return nil, errWriterShareFull
+		}, "ratelimit"
+	}
 	p.pendingLeaves = append(p.pendingLeaves, leaf)
+	if writer != "" {
+		p.byWriter[writer]++
+	}
 	f = func(ctx context.Context) (*sunlight.LogEntry, error) {
 		select {
 		case <-ctx.Done():

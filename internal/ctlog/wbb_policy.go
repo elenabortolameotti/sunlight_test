@@ -138,19 +138,19 @@ func CheckWBBWritePolicy(s string) (bool, error) {
 		return true, nil
 	}
 
-	if phase == PhaseVoting && role == RoleBB && entryType == EntryBallotDigest && threshold >= ThresholdOne {
+	if phase == PhaseVoting && role == RoleBB && entryType == EntryBallotDigest && threshold == ThresholdOne {
 		return true, nil
 	}
 
-	if phase == PhaseVoting && role == RoleBB && entryType == EntryBallotMetadata && threshold >= ThresholdOne {
+	if phase == PhaseVoting && role == RoleBB && entryType == EntryBallotMetadata && threshold == ThresholdOne {
 		return true, nil
 	}
 
-	if phase == PhaseVoting && role == RoleBB && entryType == EntryCastIntendedProof && threshold >= ThresholdOne {
+	if phase == PhaseVoting && role == RoleBB && entryType == EntryCastIntendedProof && threshold == ThresholdOne {
 		return true, nil
 	}
 
-	if phase == PhaseTallying && role == RoleBB && entryType == EntryEncryptedBallot && threshold >= ThresholdOne {
+	if phase == PhaseTallying && role == RoleBB && entryType == EntryEncryptedBallot && threshold == ThresholdOne {
 		return true, nil
 	}
 
